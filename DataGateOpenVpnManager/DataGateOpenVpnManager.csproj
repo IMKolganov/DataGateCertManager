@@ -5,9 +5,9 @@
         <Nullable>enable</Nullable>
         <ImplicitUsings>enable</ImplicitUsings>
         <ApplicationIcon>wwwroot\favicon.ico</ApplicationIcon>
-        <Version>1.2.5.78</Version>
-        <AssemblyVersion>1.2.5.78</AssemblyVersion>
-        <FileVersion>1.2.5.78</FileVersion>
+        <Version>1.2.5.81</Version>
+        <AssemblyVersion>1.2.5.81</AssemblyVersion>
+        <FileVersion>1.2.5.81</FileVersion>
         <RootNamespace>DataGateOpenVpnManager</RootNamespace>
     </PropertyGroup>
 
@@ -18,7 +18,7 @@
         <PackageReference Include="Microsoft.AspNetCore.SignalR.Protocols.NewtonsoftJson" Version="10.0.9" />
         <PackageReference Include="Newtonsoft.Json" Version="13.0.4" />
         <!-- DataGateMonitor.SharedModels: NuGet package only; do not use ProjectReference to the SharedModels .csproj. -->
-        <PackageReference Include="DataGateMonitor.SharedModels" Version="1.0.35" />
+        <PackageReference Include="DataGateMonitor.SharedModels" Version="1.0.48" />
         <PackageReference Include="Serilog" Version="4.3.1" />
         <PackageReference Include="Serilog.Extensions.Hosting" Version="10.0.0" />
         <PackageReference Include="Serilog.Extensions.Logging" Version="10.0.0" />
@@ -36,6 +36,9 @@
       <None Include="wwwroot\favicon.ico">
         <CopyToOutputDirectory>Always</CopyToOutputDirectory>
       </None>
+      <Content Update="externalipsettings.json">
+        <CopyToOutputDirectory>PreserveNewest</CopyToOutputDirectory>
+      </Content>
     </ItemGroup>
 
 </Project>

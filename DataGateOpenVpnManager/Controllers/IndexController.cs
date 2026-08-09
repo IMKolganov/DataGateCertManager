@@ -2,6 +2,7 @@ using System.Reflection;
 using Microsoft.AspNetCore.Mvc;
 using DataGateMonitor.SharedModels.DataGateOpenVpnManager.Info;
 using DataGateMonitor.SharedModels.Responses;
+using DataGateOpenVpnManager.Services.Interfaces;
 
 namespace DataGateOpenVpnManager.Controllers;
 
@@ -10,7 +11,8 @@ namespace DataGateOpenVpnManager.Controllers;
 public class IndexController(
     IConfiguration config,
     IWebHostEnvironment env,
-    ILogger<IndexController> logger)
+    ILogger<IndexController> logger,
+    IExternalIpAddressService externalIpAddressService)
     : ControllerBase
 {
     [HttpGet]
@@ -19,12 +21,23 @@ public class IndexController(
         try
         {
             var version = Assembly.GetExecutingAssembly().GetName().Version?.ToString() ?? "Unknown version";
+            string? publicIp = null;
+            try
+            {
+                publicIp = await externalIpAddressService.GetPublicIpAddressAsync(cancellationToken);
+            }
+            catch (Exception ex)
+            {
+                logger.LogWarning(ex, "Failed to resolve PublicIp for /api/info");
+            }
+
             var response = new RootOpenVpnInfoResponse
             {
                 Version = version,
                 Environment = env.EnvironmentName,
                 Application = "DataGateOpenVpnManager",
                 Description = "This service manages OpenVPN certificates and provides a JSON API for operations like create/revoke.",
+                PublicIp = publicIp,
                 Config = new ConfigInfoResponse
                 {
                     Dns1 = config["DNS1"],

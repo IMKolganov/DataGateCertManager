@@ -38,6 +38,12 @@ public static class ServiceConfiguration
 
         services.ConfigureEasyRsa(config);
 
+        services.AddMemoryCache();
+        services.AddHttpClient<IExternalIpAddressService, ExternalIpAddressService>(client =>
+        {
+            client.Timeout = TimeSpan.FromSeconds(10);
+        });
+
         // HttpClient for MicroserviceJwtValidator
         services.AddHttpClient<MicroserviceJwtValidator>(client =>
         {
