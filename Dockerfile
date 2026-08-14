@@ -1,9 +1,9 @@
 # ==========================
-# Stage 1: Build OpenVPN from source (override: --build-arg OPENVPN_VERSION=2.7.4)
+# Stage 1: Build OpenVPN from source (override: --build-arg OPENVPN_VERSION=2.7.6)
 # ==========================
 FROM debian:12-slim AS openvpn-build
 
-ARG OPENVPN_VERSION=2.7.4
+ARG OPENVPN_VERSION=2.7.6
 
 RUN apt-get update && \
     apt-get install -y \

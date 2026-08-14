@@ -73,6 +73,9 @@ Environment variables:
 | `DATA_DIR`                  | Data directory for config/logs/pki | `/mnt`               |
 | `DNS1`, `DNS2`              | Pushed DNS servers                 | `8.8.8.8`, `8.8.4.4` |
 | `MSSFIX`                    | Optional `push "mssfix N"` to clients (WSS/UDP) | _(unset)_ |
+| `DCO`                       | Enable OpenVPN DCO (`true`/`1`/`yes`) | `false` |
+| `CIPHER`                    | Data-channel cipher                 | `AES-128-GCM` if DCO, else `AES-256-CBC` |
+| `DATA_CIPHERS`              | OpenVPN `data-ciphers` list         | GCM/ChaCha list if DCO, else unset |
 | `VPN_SUBNET`, `VPN_NETMASK` | VPN subnet config                  | `10.51.28.0/24`      |
 | `OpenVpnManagement__Port`   | OpenVPN management interface port  | `5092`               |
 | `OpenVpnProxy__ByteDebug`   | Compare proxy vs management bytes (WSS debug) | `false` |

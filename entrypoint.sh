@@ -16,6 +16,9 @@ WAN_IF="${WAN_IF:-eth0}"
 DCO="${DCO:-false}"
 # Optional push to clients (e.g. 1200 for WSS/UDP tunnels with reduced effective MTU).
 MSSFIX="${MSSFIX:-}"
+# Cipher: override with CIPHER / DATA_CIPHERS. DCO needs AEAD (GCM/ChaCha), not CBC.
+CIPHER="${CIPHER:-}"
+DATA_CIPHERS="${DATA_CIPHERS:-}"
 
 EASYRSA_DIR="$DATA_DIR/easy-rsa"
 SCRIPT_SOURCE="/scripts"
@@ -110,11 +113,25 @@ done
 # Generate default server.conf if not present
 echo "Generating server.conf from environment..."
 # DCO=false (default) -> disable-dco in config; DCO=true -> DCO enabled, no disable-dco
+# DCO data-path needs AEAD (GCM/ChaCha); CBC stays in userspace and caps throughput.
 if [ "$DCO" = "true" ] || [ "$DCO" = "1" ] || [ "$DCO" = "yes" ]; then
   DCO_OPTION=""
+  CIPHER="${CIPHER:-AES-128-GCM}"
+  DATA_CIPHERS="${DATA_CIPHERS:-AES-128-GCM:AES-256-GCM:CHACHA20-POLY1305}"
 else
   DCO_OPTION="disable-dco"
+  CIPHER="${CIPHER:-AES-256-CBC}"
+  # leave DATA_CIPHERS empty unless explicitly set
 fi
+
+if [ -n "$DATA_CIPHERS" ]; then
+  CIPHER_LINES="data-ciphers $DATA_CIPHERS
+cipher $CIPHER"
+else
+  CIPHER_LINES="cipher $CIPHER"
+fi
+echo "[entrypoint] DCO=${DCO:-false} cipher=$CIPHER data-ciphers=${DATA_CIPHERS:-<none>}"
+
 MSSFIX_LINE=""
 if [ -n "$MSSFIX" ]; then
   MSSFIX_LINE="push \"mssfix $MSSFIX\""
@@ -148,7 +165,7 @@ remote-cert-tls client
 tls-version-min 1.2
 tls-crypt /etc/openvpn/ta.key
 
-cipher AES-256-CBC
+$CIPHER_LINES
 auth SHA256
 
 user nobody
