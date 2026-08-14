@@ -32,6 +32,8 @@ public static class ServiceConfiguration
 
         // OpenVpn services
         services.AddScoped<IOpenVpnServerService, OpenVpnServerService>();
+        services.AddSingleton<IOpenVpnProcessRunner, LinuxOpenVpnProcessRunner>();
+        services.AddSingleton<IOpenVpnProcessService, OpenVpnProcessService>();
 
         // Rate Limiting
         services.AddRateLimiter(options =>

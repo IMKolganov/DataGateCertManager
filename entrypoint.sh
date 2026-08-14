@@ -230,8 +230,9 @@ echo "===== server.conf contents ====="
 cat "$DATA_DIR/server.conf" || echo "server.conf not found!"
 
 echo "===== Starting OpenVPN in background..."
-openvpn --config "$DATA_DIR/server.conf" &
+openvpn --config "$DATA_DIR/server.conf" --writepid "$DATA_DIR/openvpn.pid" &
 OPENVPN_PID=$!
+echo "[entrypoint] OpenVPN pid=$OPENVPN_PID (also in $DATA_DIR/openvpn.pid)"
 
 # 👇 Stream OpenVPN logs to Docker stdout (suppress raw tls-crypt probe noise; enrichment service re-logs with origin tags)
 echo "===== Attaching OpenVPN log to stdout... ====="
@@ -267,22 +268,29 @@ cd /app
 dotnet DataGateOpenVpnManager.dll &
 DOTNET_PID=$!
 
-# Wait for OpenVPN and .NET
-wait $OPENVPN_PID
-OPENVPN_EXIT_CODE=$?
-
+# Keep container alive on the .NET manager. OpenVPN may be killed/restarted via
+# POST /api/openvpn/{start|restart|kill} without exiting the container.
 wait $DOTNET_PID
 DOTNET_EXIT_CODE=$?
 
+# Stop OpenVPN (current pid file or original entrypoint pid) when manager exits.
+if [ -f "$DATA_DIR/openvpn.pid" ]; then
+  OPENVPN_CURRENT_PID="$(tr -d '[:space:]' < "$DATA_DIR/openvpn.pid" || true)"
+  if [ -n "$OPENVPN_CURRENT_PID" ] && kill -0 "$OPENVPN_CURRENT_PID" 2>/dev/null; then
+    echo "[entrypoint] Stopping OpenVPN pid=$OPENVPN_CURRENT_PID after manager exit"
+    kill "$OPENVPN_CURRENT_PID" 2>/dev/null || true
+  fi
+elif kill -0 "$OPENVPN_PID" 2>/dev/null; then
+  echo "[entrypoint] Stopping original OpenVPN pid=$OPENVPN_PID after manager exit"
+  kill "$OPENVPN_PID" 2>/dev/null || true
+fi
+
 # Kill tail (optional, for clean shutdown)
 kill $TAIL_PID 2>/dev/null || true
-
-if [ $OPENVPN_EXIT_CODE -ne 0 ]; then
-  echo "OpenVPN exited with code $OPENVPN_EXIT_CODE"
-  exit $OPENVPN_EXIT_CODE
-fi
 
 if [ $DOTNET_EXIT_CODE -ne 0 ]; then
   echo ".NET app exited with code $DOTNET_EXIT_CODE"
   exit $DOTNET_EXIT_CODE
 fi
+
+exit 0

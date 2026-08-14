@@ -39,6 +39,12 @@ public class ServiceConfigurationTests
 
         var openVpnServer = scope1.ServiceProvider.GetService<IOpenVpnServerService>();
         Assert.NotNull(openVpnServer);
+
+        var process1 = provider.GetService<IOpenVpnProcessService>();
+        var process2 = provider.GetService<IOpenVpnProcessService>();
+        Assert.NotNull(process1);
+        Assert.Same(process1, process2);
+        Assert.NotNull(provider.GetService<IOpenVpnProcessRunner>());
     }
 
     [Fact]
