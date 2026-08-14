@@ -76,6 +76,9 @@ Environment variables:
 | `DCO`                       | Enable OpenVPN DCO (`true`/`1`/`yes`) | `false` |
 | `CIPHER`                    | Data-channel cipher                 | `AES-128-GCM` if DCO, else `AES-256-CBC` |
 | `DATA_CIPHERS`              | OpenVPN `data-ciphers` list         | GCM/ChaCha list if DCO, else unset |
+| `TUN_DEV`                   | Fixed tun device name (stable ufw/NAT) | _(unset → `dev tun`) |
+| `TUN_IF`                    | Extra FORWARD by iface (optional)   | _(unset)_ |
+| `WAN_IF`                    | WAN iface for MASQUERADE            | `eth0` (auto if missing) |
 | `VPN_SUBNET`, `VPN_NETMASK` | VPN subnet config                  | `10.51.28.0/24`      |
 | `OpenVpnManagement__Port`   | OpenVPN management interface port  | `5092`               |
 | `OpenVpnProxy__ByteDebug`   | Compare proxy vs management bytes (WSS debug) | `false` |
@@ -95,6 +98,32 @@ Environment variables:
 | `PIHOLE_POLL_INTERVAL_SEC`    | Legacy env alias for `PiHole__PollIntervalSeconds`        | _(unset)_ |
 
 **Pi-hole config priority (highest wins):** `PIHOLE_*` / `PiHole__*` env vars → dashboard **Save & apply** (`$DATA_DIR/pihole-runtime-config.json`) → `appsettings` defaults. Env overrides only the fields that are set.
+
+### Multi-stack host (fixed tun + UFW by subnet)
+
+Do **not** rely on `tunN` names in UFW — they change on every OpenVPN recreate. Use:
+
+1. **Image ≥ 1.2.5.94** with `TUN_DEV=ovpn-udp` (unique per stack) — entrypoint writes `dev ovpn-udp` / `dev-type tun`, deletes orphans that still hold this subnet’s `.1`, and installs FORWARD/NAT by **CIDR**.
+2. **Host UFW once per subnet** (survives reboot and tun renames):
+
+```bash
+sudo chmod +x scripts/host-ufw-vpn-subnet.sh
+# UDP pool → internet + DNS via Pi-hole on TCP tun (10.51.30.1):
+sudo ./scripts/host-ufw-vpn-subnet.sh 10.51.32.0/24 10.51.30.1
+```
+
+3. Compose env for UDP WSS:
+
+```yaml
+TUN_DEV: ovpn-udp
+VPN_SUBNET: "10.51.32.0"
+DNS1: "10.51.30.1"
+DNS2: "10.51.30.1"
+DCO: "true"
+CIPHER: "AES-128-GCM"
+```
+
+Keep DNS push on Pi-hole (`10.51.30.1`), not public `1.1.1.1`.
 
 ---
 

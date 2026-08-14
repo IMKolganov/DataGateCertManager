@@ -28,6 +28,8 @@ services:
       WAN_IF: eth0
       VPN_SUBNET: "10.50.28.0"
       VPN_NETMASK: "255.255.255.0"
+      # Stable device name — set a unique value per stack on multi-VPN hosts
+      TUN_DEV: ovpn-udp
 
 
 networks:

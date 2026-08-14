@@ -11,7 +11,10 @@ DNS1=${DNS1:-8.8.8.8}
 DNS2=${DNS2:-8.8.4.4}
 VPN_SUBNET=${VPN_SUBNET:-10.51.28.0}
 VPN_NETMASK=${VPN_NETMASK:-255.255.255.0}
-TUN_IF="${TUN_IF:-tun0}"
+# Fixed tun name (stable across restarts). Empty = classic "dev tun" (kernel picks tunN).
+TUN_DEV="${TUN_DEV:-}"
+# Optional iface for FORWARD (e.g. tcp-wss + Pi-hole on tun0). Prefer subnet rules + TUN_DEV.
+TUN_IF="${TUN_IF:-}"
 WAN_IF="${WAN_IF:-eth0}"
 DCO="${DCO:-false}"
 # Optional push to clients (e.g. 1200 for WSS/UDP tunnels with reduced effective MTU).
@@ -31,12 +34,53 @@ fi
 
 echo "===== STARTING OPENVPN CONTAINER ====="
 
-# NAT/forward
+# Prefer default route device when WAN_IF left at eth0 but host uses another NIC.
+if [ "$WAN_IF" = "eth0" ] && ! ip -br link show eth0 >/dev/null 2>&1; then
+  WAN_IF=$(ip route get 1.1.1.1 2>/dev/null | awk '{for(i=1;i<=NF;i++) if($i=="dev"){print $(i+1); exit}}')
+  WAN_IF="${WAN_IF:-eth0}"
+fi
+
+# iptables prefers CIDR; map common dotted masks.
+case "$VPN_NETMASK" in
+  255.255.255.0) VPN_PREFIX=24 ;;
+  255.255.0.0)   VPN_PREFIX=16 ;;
+  255.0.0.0)     VPN_PREFIX=8 ;;
+  *)             VPN_PREFIX=24 ;;
+esac
+VPN_CIDR="$VPN_SUBNET/$VPN_PREFIX"
+# Server address on tun (.1 for typical /24 pool).
+VPN_SERVER_IP="${VPN_SUBNET%.*}.1"
+
+echo "[entrypoint] WAN_IF=$WAN_IF VPN_CIDR=$VPN_CIDR TUN_DEV=${TUN_DEV:-<auto>} TUN_IF=${TUN_IF:-<none>}"
+
+# NAT + forward by subnet (stable; do not depend on tun0/tun4 name churn).
 iptables -P FORWARD ACCEPT
-iptables -C FORWARD -i "$TUN_IF" -j ACCEPT 2>/dev/null || iptables -A FORWARD -i "$TUN_IF" -j ACCEPT
-iptables -C FORWARD -o "$TUN_IF" -j ACCEPT 2>/dev/null || iptables -A FORWARD -o "$TUN_IF" -j ACCEPT
-iptables -t nat -C POSTROUTING -s "$VPN_SUBNET/$VPN_NETMASK" -o "$WAN_IF" -j MASQUERADE 2>/dev/null \
-  || iptables -t nat -A POSTROUTING -s "$VPN_SUBNET/$VPN_NETMASK" -o "$WAN_IF" -j MASQUERADE
+iptables -C FORWARD -s "$VPN_CIDR" -j ACCEPT 2>/dev/null \
+  || iptables -I FORWARD 1 -s "$VPN_CIDR" -j ACCEPT
+iptables -C FORWARD -d "$VPN_CIDR" -j ACCEPT 2>/dev/null \
+  || iptables -I FORWARD 1 -d "$VPN_CIDR" -j ACCEPT
+# Optional iface rules (tcp-wss + pi-hole on a known tun).
+if [ -n "$TUN_IF" ]; then
+  iptables -C FORWARD -i "$TUN_IF" -j ACCEPT 2>/dev/null || iptables -A FORWARD -i "$TUN_IF" -j ACCEPT
+  iptables -C FORWARD -o "$TUN_IF" -j ACCEPT 2>/dev/null || iptables -A FORWARD -o "$TUN_IF" -j ACCEPT
+fi
+iptables -t nat -C POSTROUTING -s "$VPN_CIDR" -o "$WAN_IF" -j MASQUERADE 2>/dev/null \
+  || iptables -t nat -A POSTROUTING -s "$VPN_CIDR" -o "$WAN_IF" -j MASQUERADE
+
+# Drop orphan ifaces that still hold this stack's .1 (leftover from `dev tun` restarts).
+KEEP_IF="${TUN_DEV:-$TUN_IF}"
+ip -o -4 addr show 2>/dev/null | awk -v ip="$VPN_SERVER_IP/" '$0 ~ ip {print $2}' | while read -r iface; do
+  [ -z "$iface" ] && continue
+  [ -n "$KEEP_IF" ] && [ "$iface" = "$KEEP_IF" ] && continue
+  echo "[entrypoint] Removing orphan $iface (had $VPN_SERVER_IP)"
+  ip link delete "$iface" 2>/dev/null || true
+done
+
+# Drop stale fixed-name device so OpenVPN can recreate it cleanly.
+if [ -n "$TUN_DEV" ] && ip link show "$TUN_DEV" >/dev/null 2>&1; then
+  echo "[entrypoint] Removing stale $TUN_DEV before OpenVPN start"
+  ip link delete "$TUN_DEV" 2>/dev/null || true
+fi
 
 echo "===== Copying OpenVPN hook scripts ====="
 mkdir -p /etc/openvpn/scripts
@@ -137,10 +181,18 @@ if [ -n "$MSSFIX" ]; then
   MSSFIX_LINE="push \"mssfix $MSSFIX\""
   echo "[entrypoint] MSSFIX push enabled: $MSSFIX"
 fi
+
+if [ -n "$TUN_DEV" ]; then
+  DEV_LINES="dev $TUN_DEV
+dev-type tun"
+else
+  DEV_LINES="dev tun"
+fi
+
 cat <<EOF > "$DATA_DIR/server.conf"
 port $PORT
 proto $PROTO
-dev tun
+$DEV_LINES
 $DCO_OPTION
 
 ca /etc/openvpn/ca.crt
