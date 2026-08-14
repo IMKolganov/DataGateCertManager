@@ -13,7 +13,8 @@ public class EasyRsaService(
     IEasyRsaParseDbService easyRsaParseDbService,
     IBashCommandRunner easyRsaExecCommandService,
     IOpenVpnServerService openVpnServerService,
-    IOptions<EasyRsaOptions> options)
+    IOptions<EasyRsaOptions> options,
+    IEasyRsaPkiMutex pkiMutex)
     : IEasyRsaService
 {
     private readonly ILogger<IEasyRsaService> _logger = logger ?? throw new ArgumentNullException(nameof(logger));
@@ -52,6 +53,8 @@ public class EasyRsaService(
         int certExpireDays = 365)
     {
         easyRsaPath = Path.GetFullPath(easyRsaPath);
+        await using var _ = await pkiMutex.AcquireAsync(easyRsaPath, cancellationToken);
+
         var pkiPath = Path.Combine(easyRsaPath, "pki");
         var reqPath = Path.Combine(pkiPath, "reqs", $"{commonName}.req");
 
@@ -124,6 +127,8 @@ public class EasyRsaService(
         var serialNumber = string.Empty;
 
         easyRsaPath = Path.GetFullPath(easyRsaPath);
+        await using var _ = await pkiMutex.AcquireAsync(easyRsaPath, cancellationToken);
+
         var pkiPath = Path.Combine(easyRsaPath, "pki");
         var issuedPath = Path.Combine(pkiPath, "issued", $"{commonName}.crt");
 
@@ -188,6 +193,8 @@ public class EasyRsaService(
     {
         var fullEasyRsaPath = Path.GetFullPath(easyRsaPath);
         var fullEasyRsaPkiPath = Path.Combine(fullEasyRsaPath, "pki");
+
+        await using var _ = await pkiMutex.AcquireAsync(fullEasyRsaPath, cancellationToken);
         
         var taKeyName = options.Value.TaKeyFileName;
         if (!Directory.Exists(fullEasyRsaPkiPath) || !File.Exists(Path.Combine(easyRsaPath, "pki", taKeyName)))
@@ -369,8 +376,10 @@ public class EasyRsaService(
     private async Task<ServerCertificate> MatchingCertsAsync(string easyRsaPath, string serialNumber, string commonName,
         CancellationToken cancellationToken)
     {
-        var certificateInfoInIndexFile = await GetAllCertificateInfoInIndexFileAsync(easyRsaPath, 
-            cancellationToken);
+        // Parse index directly — do not call GetAll (would re-enter Install under the same PKI lock).
+        var pkiPath = Path.Combine(Path.GetFullPath(easyRsaPath), "pki");
+        var certificateInfoInIndexFile = await easyRsaParseDbService.ParseCertificateInfoInIndexFileAsync(
+            pkiPath, cancellationToken);
         var matchingCerts = certificateInfoInIndexFile
             .Where(x => x.SerialNumber == serialNumber& x.CommonName == commonName)
             .ToList();

@@ -11,10 +11,21 @@ public static class ServiceConfiguration
 {
     public static void ConfigureServices(this IServiceCollection services, IConfiguration config)
     {
-        // Core services
+        // Core services — download wait while issuing (default 10s; override via env).
+        services.Configure<OvpnIssuanceOptions>(config.GetSection(OvpnIssuanceOptions.SectionName));
+        services.PostConfigure<OvpnIssuanceOptions>(options =>
+        {
+            var raw = Environment.GetEnvironmentVariable(OvpnIssuanceOptions.WaitTimeoutSecondsEnvVar);
+            if (string.IsNullOrWhiteSpace(raw))
+                raw = config[OvpnIssuanceOptions.WaitTimeoutSecondsEnvVar];
+            if (int.TryParse(raw, out var seconds) && seconds > 0)
+                options.WaitTimeoutSeconds = seconds;
+        });
+        services.AddSingleton<IOvpnIssuanceTracker, OvpnIssuanceTracker>();
         services.AddScoped<IOvpnFileService, OvpnFileService>();
 
-        // EasyRsa services
+        // EasyRsa services — PKI mutex must be singleton so all scopes share one gate per path.
+        services.AddSingleton<IEasyRsaPkiMutex, EasyRsaPkiMutex>();
         services.AddScoped<IEasyRsaService, EasyRsaService>();
         services.AddScoped<IEasyRsaParseDbService, EasyRsaParseDbService>();
         services.AddScoped<IBashCommandRunner, BashCommandRunner>();

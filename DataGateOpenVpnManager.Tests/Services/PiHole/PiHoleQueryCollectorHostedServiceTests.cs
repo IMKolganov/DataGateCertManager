@@ -64,6 +64,7 @@ public class PiHoleQueryCollectorHostedServiceTests
             cursor.Object,
             new PiHoleCollectorStatusStore(),
             cache.Object,
+            Options.Create(new OpenVpnProxyOptions()),
             hub.Object,
             NullLogger<PiHoleQueryCollectorHostedService>.Instance);
 
@@ -134,6 +135,7 @@ public class PiHoleQueryCollectorHostedServiceTests
             "raw",
             [],
             true));
+        cache.Setup(x => x.RefreshAsync(It.IsAny<CancellationToken>())).Returns(Task.CompletedTask);
 
         var clientProxy = new Mock<IClientProxy>();
         var clients = new Mock<IHubClients>();
@@ -149,12 +151,72 @@ public class PiHoleQueryCollectorHostedServiceTests
             CancellationToken.None);
 
         Assert.Equal(0, count);
+        cache.Verify(x => x.RefreshAsync(It.IsAny<CancellationToken>()), Times.Once);
         clientProxy.Verify(
             c => c.SendCoreAsync("DnsQueriesReceived", It.IsAny<object?[]>(), It.IsAny<CancellationToken>()),
             Times.Never);
         var snapshot = status.GetSnapshot();
         Assert.Equal(1, snapshot.LastPollQueriesAfterFilter);
         Assert.Equal(0, snapshot.LastPollQueriesEnriched);
+    }
+
+    [Fact]
+    public async Task CollectOnceAsync_RefreshesEmptyManagementSnapshot_ThenMaps()
+    {
+        var api = new Mock<IPiHoleApiClient>();
+        api.Setup(x => x.GetQueriesSinceAsync(
+                It.IsAny<DateTimeOffset>(),
+                It.IsAny<DateTimeOffset>(),
+                It.IsAny<int>(),
+                It.IsAny<CancellationToken>()))
+            .ReturnsAsync(new PiHoleQueryFetchResult
+            {
+                TotalFromApi = 1,
+                Records =
+                [
+                    new PiHoleQueryRecord(12, "10.51.30.3", "mapped.test", "A", "FORWARDED", DateTimeOffset.UtcNow)
+                ]
+            });
+
+        var cursor = new Mock<IPiHoleQueryCursorStore>();
+        cursor.Setup(x => x.GetLastUntilUtc()).Returns((DateTimeOffset?)null);
+
+        var empty = new OpenVpnManagementStatusSnapshot(DateTime.UtcNow.AddDays(-4), "TITLE\tEND", [], true);
+        var filled = new OpenVpnManagementStatusSnapshot(
+            DateTime.UtcNow,
+            "raw",
+            [new OpenVpnManagementClientEntry("cn-1", "1.2.3.4:1234", "10.51.30.3", 0, 0, 0)],
+            true);
+
+        var cache = new Mock<IOpenVpnManagementStatusCache>();
+        cache.SetupSequence(x => x.GetSnapshot())
+            .Returns(empty)
+            .Returns(filled);
+        cache.Setup(x => x.RefreshAsync(It.IsAny<CancellationToken>())).Returns(Task.CompletedTask);
+
+        var clientProxy = new Mock<IClientProxy>();
+        clientProxy.Setup(c => c.SendCoreAsync(
+                "DnsQueriesReceived",
+                It.IsAny<object?[]>(),
+                It.IsAny<CancellationToken>()))
+            .Returns(Task.CompletedTask);
+        var clients = new Mock<IHubClients>();
+        clients.Setup(c => c.All).Returns(clientProxy.Object);
+        var hub = new Mock<IHubContext<OpenVpnEventHub>>();
+        hub.Setup(h => h.Clients).Returns(clients.Object);
+
+        var status = new PiHoleCollectorStatusStore();
+        var sut = CreateSut(api.Object, cursor.Object, status, cache: cache.Object, hubClients: hub);
+
+        var count = await sut.CollectOnceAsync(
+            new PiHoleOptions { BatchSize = 50, LookbackSeconds = 60 },
+            CancellationToken.None);
+
+        Assert.Equal(1, count);
+        cache.Verify(x => x.RefreshAsync(It.IsAny<CancellationToken>()), Times.Once);
+        clientProxy.Verify(
+            c => c.SendCoreAsync("DnsQueriesReceived", It.IsAny<object?[]>(), It.IsAny<CancellationToken>()),
+            Times.Once);
     }
 
     [Fact]
@@ -216,6 +278,7 @@ public class PiHoleQueryCollectorHostedServiceTests
             cursor,
             status,
             managementCache,
+            Options.Create(new OpenVpnProxyOptions()),
             hub.Object,
             NullLogger<PiHoleQueryCollectorHostedService>.Instance);
     }

@@ -1,5 +1,6 @@
 using DataGateOpenVpnManager.Configurations;
 using DataGateOpenVpnManager.Helpers;
+using DataGateOpenVpnManager.Services;
 using DataGateOpenVpnManager.Services.EasyRsaServices.Interfaces;
 using DataGateOpenVpnManager.Services.Interfaces;
 using DataGateOpenVpnManager.Services.Proxy;
@@ -17,6 +18,7 @@ public class ServiceConfigurationTests
         var configData = new Dictionary<string, string?> { ["Backend:BaseUrl"] = "http://localhost:9999/" };
         var config = new ConfigurationBuilder().AddInMemoryCollection(configData!).Build();
         services.AddSingleton<IConfiguration>(config);
+        services.AddLogging();
 
         services.ConfigureServices(config);
         var provider = services.BuildServiceProvider();
@@ -97,5 +99,79 @@ public class ServiceConfigurationTests
         var flow1 = provider.GetRequiredService<IProxyTrafficFlowService>();
         var flow2 = provider.GetRequiredService<IProxyTrafficFlowService>();
         Assert.Same(flow1, flow2);
+    }
+
+    [Fact]
+    public void ConfigureServices_RegistersSingletonEasyRsaPkiMutex()
+    {
+        var services = new ServiceCollection();
+        var configData = new Dictionary<string, string?> { ["Backend:BaseUrl"] = "http://localhost:9999/" };
+        var config = new ConfigurationBuilder().AddInMemoryCollection(configData!).Build();
+        services.AddSingleton<IConfiguration>(config);
+
+        services.ConfigureServices(config);
+        var provider = services.BuildServiceProvider();
+
+        using var scope1 = provider.CreateScope();
+        using var scope2 = provider.CreateScope();
+        var m1 = scope1.ServiceProvider.GetRequiredService<IEasyRsaPkiMutex>();
+        var m2 = scope2.ServiceProvider.GetRequiredService<IEasyRsaPkiMutex>();
+        Assert.Same(m1, m2);
+    }
+
+    [Fact]
+    public void ConfigureServices_RegistersSingletonOvpnIssuanceTracker()
+    {
+        var services = new ServiceCollection();
+        var configData = new Dictionary<string, string?> { ["Backend:BaseUrl"] = "http://localhost:9999/" };
+        var config = new ConfigurationBuilder().AddInMemoryCollection(configData!).Build();
+        services.AddSingleton<IConfiguration>(config);
+        services.AddLogging();
+
+        services.ConfigureServices(config);
+        var provider = services.BuildServiceProvider();
+
+        using var scope1 = provider.CreateScope();
+        using var scope2 = provider.CreateScope();
+        var t1 = scope1.ServiceProvider.GetRequiredService<IOvpnIssuanceTracker>();
+        var t2 = scope2.ServiceProvider.GetRequiredService<IOvpnIssuanceTracker>();
+        Assert.Same(t1, t2);
+    }
+
+    [Fact]
+    public void ConfigureServices_AppliesOvpnIssuanceWaitTimeoutFromEnv()
+    {
+        var services = new ServiceCollection();
+        var configData = new Dictionary<string, string?>
+        {
+            ["Backend:BaseUrl"] = "http://localhost:9999/",
+            [OvpnIssuanceOptions.WaitTimeoutSecondsEnvVar] = "42",
+        };
+        var config = new ConfigurationBuilder().AddInMemoryCollection(configData!).Build();
+        services.AddSingleton<IConfiguration>(config);
+        services.AddLogging();
+
+        services.ConfigureServices(config);
+        var provider = services.BuildServiceProvider();
+
+        var options = provider.GetRequiredService<Microsoft.Extensions.Options.IOptions<OvpnIssuanceOptions>>().Value;
+        Assert.Equal(42, options.WaitTimeoutSeconds);
+    }
+
+    [Fact]
+    public void ConfigureServices_OvpnIssuanceWaitTimeoutDefaultsToTen()
+    {
+        var services = new ServiceCollection();
+        var configData = new Dictionary<string, string?> { ["Backend:BaseUrl"] = "http://localhost:9999/" };
+        var config = new ConfigurationBuilder().AddInMemoryCollection(configData!).Build();
+        services.AddSingleton<IConfiguration>(config);
+        services.AddLogging();
+
+        services.ConfigureServices(config);
+        var provider = services.BuildServiceProvider();
+
+        var options = provider.GetRequiredService<Microsoft.Extensions.Options.IOptions<OvpnIssuanceOptions>>().Value;
+        Assert.Equal(OvpnIssuanceOptions.DefaultWaitTimeoutSeconds, options.WaitTimeoutSeconds);
+        Assert.Equal(10, options.WaitTimeoutSeconds);
     }
 }

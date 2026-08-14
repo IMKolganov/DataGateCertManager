@@ -17,8 +17,7 @@ internal static class ProxyManagementPeerDiagnostics
         }
 
         var cacheAge = DateTime.UtcNow - snapshot.FetchedAtUtc;
-        var maxCacheAge = TimeSpan.FromSeconds(Math.Max(10, options.ManagementStatusRefreshSeconds * 2));
-        if (cacheAge > maxCacheAge)
+        if (cacheAge > options.ManagementCacheMaxAge)
         {
             skipReason = "management_cache_stale";
             return false;
@@ -32,6 +31,23 @@ internal static class ProxyManagementPeerDiagnostics
 
         skipReason = null;
         return true;
+    }
+
+    /// <summary>
+    /// True when the Pi-hole (or other) consumer should call <c>RefreshAsync</c> before IP→CN mapping.
+    /// An empty-but-"valid" snapshot must not be trusted forever — that stuck the DNS collector in production.
+    /// </summary>
+    public static bool NeedsRefreshForClientMapping(
+        OpenVpnManagementStatusSnapshot? snapshot,
+        TimeSpan maxAge)
+    {
+        if (snapshot is null || !snapshot.IsValid)
+            return true;
+
+        if (snapshot.Clients.Count == 0)
+            return true;
+
+        return DateTime.UtcNow - snapshot.FetchedAtUtc > maxAge;
     }
 
     public static bool IsLikelyZombie(

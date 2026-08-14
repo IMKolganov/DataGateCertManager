@@ -63,7 +63,16 @@ public sealed class OpenVpnProxyOptions
 
     internal bool IsSessionAuditEnabled => SessionAudit || ByteDebug;
 
-    internal bool NeedsBackgroundManagementRefresh =>
-        CloseZombieAfterMissingSeconds > 0
+    /// <summary>
+    /// Background <c>status 3</c> polling is required for zombie detection, byte-debug,
+    /// and Pi-hole DNS CN mapping (otherwise the cache can stay empty/stale forever).
+    /// </summary>
+    internal bool NeedsBackgroundManagementRefresh(bool piHoleCollectorEnabled) =>
+        piHoleCollectorEnabled
+        || CloseZombieAfterMissingSeconds > 0
         || ByteDebug && ByteDebugIntervalSeconds > 0;
+
+    /// <summary>Max age before a management snapshot is considered stale for consumers.</summary>
+    internal TimeSpan ManagementCacheMaxAge =>
+        TimeSpan.FromSeconds(Math.Max(10, ManagementStatusRefreshSeconds * 2));
 }
