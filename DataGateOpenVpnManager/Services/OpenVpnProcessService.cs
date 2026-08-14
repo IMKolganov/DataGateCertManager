@@ -1,4 +1,4 @@
-using DataGateOpenVpnManager.Models;
+using DataGateMonitor.SharedModels.DataGateOpenVpnManager.OpenVpnProcess.Responses;
 using DataGateOpenVpnManager.Services.Interfaces;
 
 namespace DataGateOpenVpnManager.Services;

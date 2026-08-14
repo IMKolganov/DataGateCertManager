@@ -1,5 +1,5 @@
+using DataGateMonitor.SharedModels.DataGateOpenVpnManager.OpenVpnProcess.Responses;
 using DataGateMonitor.SharedModels.Responses;
-using DataGateOpenVpnManager.Models;
 using DataGateOpenVpnManager.Services.Interfaces;
 using Microsoft.AspNetCore.Mvc;
 
