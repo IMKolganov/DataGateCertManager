@@ -18,8 +18,15 @@ public class OpenVpnProcessController(IOpenVpnProcessService processService) : C
     public async Task<ActionResult<ApiResponse<OpenVpnProcessStatusResponse>>> Status(
         CancellationToken cancellationToken)
     {
-        var status = await processService.GetStatusAsync(cancellationToken);
-        return Ok(ApiResponse<OpenVpnProcessStatusResponse>.SuccessResponse(status));
+        try
+        {
+            var status = await processService.GetStatusAsync(cancellationToken);
+            return Ok(ApiResponse<OpenVpnProcessStatusResponse>.SuccessResponse(status));
+        }
+        catch (InvalidOperationException ex)
+        {
+            return BadRequest(ApiResponse<OpenVpnProcessStatusResponse>.ErrorResponse(ex.Message));
+        }
     }
 
     [HttpPost("start")]
@@ -35,6 +42,10 @@ public class OpenVpnProcessController(IOpenVpnProcessService processService) : C
         catch (FileNotFoundException ex)
         {
             return NotFound(ApiResponse<OpenVpnProcessStatusResponse>.ErrorResponse(ex.Message));
+        }
+        catch (InvalidOperationException ex)
+        {
+            return BadRequest(ApiResponse<OpenVpnProcessStatusResponse>.ErrorResponse(ex.Message));
         }
     }
 
@@ -52,6 +63,10 @@ public class OpenVpnProcessController(IOpenVpnProcessService processService) : C
         {
             return NotFound(ApiResponse<OpenVpnProcessStatusResponse>.ErrorResponse(ex.Message));
         }
+        catch (InvalidOperationException ex)
+        {
+            return BadRequest(ApiResponse<OpenVpnProcessStatusResponse>.ErrorResponse(ex.Message));
+        }
     }
 
     [HttpPost("kill")]
@@ -59,7 +74,14 @@ public class OpenVpnProcessController(IOpenVpnProcessService processService) : C
     public async Task<ActionResult<ApiResponse<OpenVpnProcessStatusResponse>>> Kill(
         CancellationToken cancellationToken)
     {
-        var status = await processService.KillAsync(cancellationToken);
-        return Ok(ApiResponse<OpenVpnProcessStatusResponse>.SuccessResponse(status));
+        try
+        {
+            var status = await processService.KillAsync(cancellationToken);
+            return Ok(ApiResponse<OpenVpnProcessStatusResponse>.SuccessResponse(status));
+        }
+        catch (InvalidOperationException ex)
+        {
+            return BadRequest(ApiResponse<OpenVpnProcessStatusResponse>.ErrorResponse(ex.Message));
+        }
     }
 }
