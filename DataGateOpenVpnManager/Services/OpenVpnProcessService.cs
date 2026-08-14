@@ -9,13 +9,71 @@ public sealed class OpenVpnProcessService(
     ILogger<OpenVpnProcessService> logger) : IOpenVpnProcessService
 {
     private static readonly SemaphoreSlim Gate = new(1, 1);
+    private static readonly object OpLock = new();
     private static readonly TimeSpan StartVerifyTimeout = TimeSpan.FromSeconds(3);
     private static readonly TimeSpan StopVerifyTimeout = TimeSpan.FromSeconds(2);
     private static readonly TimeSpan StopForceVerifyTimeout = TimeSpan.FromSeconds(2);
 
-    public async Task<OpenVpnProcessStatusResponse> GetStatusAsync(CancellationToken cancellationToken)
+    internal const string BusyMessage =
+        "OpenVPN process operation already in progress. Please wait and try again.";
+
+    internal const string PhaseIdle = "idle";
+    internal const string PhaseRunning = "running";
+    internal const string PhaseStopped = "stopped";
+    internal const string PhaseStarting = "starting";
+    internal const string PhaseStopping = "stopping";
+    internal const string PhaseRestarting = "restarting";
+    internal const string PhaseFailed = "failed";
+
+    private static bool OpInProgress;
+    private static string? CurrentOp;
+    private static string CurrentPhase = PhaseIdle;
+    private static DateTime? OpStartedAtUtc;
+    private static string? LastCompletedOp;
+    private static DateTime? LastCompletedAtUtc;
+    private static string? LastError;
+
+    /// <summary>Test-only: clears process-control gate/operation snapshot between unit tests.</summary>
+    internal static void ResetStateForTests()
     {
-        await Gate.WaitAsync(cancellationToken);
+        while (Gate.CurrentCount == 0)
+            Gate.Release();
+        lock (OpLock)
+        {
+            OpInProgress = false;
+            CurrentOp = null;
+            CurrentPhase = PhaseIdle;
+            OpStartedAtUtc = null;
+            LastCompletedOp = null;
+            LastCompletedAtUtc = null;
+            LastError = null;
+        }
+    }
+
+    public Task<OpenVpnProcessStatusResponse> GetStatusAsync(CancellationToken cancellationToken)
+    {
+        // Prefer a live operation snapshot so other clients (and this UI) see restart progress
+        // without waiting behind the gate.
+        if (Volatile.Read(ref OpInProgress))
+        {
+            var busyPid = ResolveRunningPidUnsafe();
+            return Task.FromResult(BuildStatus(
+                "status",
+                busyPid,
+                BuildInProgressMessage(busyPid)));
+        }
+
+        return GetStatusWhenIdleAsync(cancellationToken);
+    }
+
+    private async Task<OpenVpnProcessStatusResponse> GetStatusWhenIdleAsync(CancellationToken cancellationToken)
+    {
+        if (!await Gate.WaitAsync(TimeSpan.FromMilliseconds(250), cancellationToken))
+        {
+            var busyPid = ResolveRunningPidUnsafe();
+            return BuildStatus("status", busyPid, BuildInProgressMessage(busyPid));
+        }
+
         try
         {
             ClearStalePidFileIfNeeded();
@@ -38,7 +96,10 @@ public sealed class OpenVpnProcessService(
 
     public async Task<OpenVpnProcessStatusResponse> StartAsync(CancellationToken cancellationToken)
     {
-        await Gate.WaitAsync(cancellationToken);
+        if (!await Gate.WaitAsync(0, cancellationToken))
+            throw new InvalidOperationException(BusyMessage);
+
+        BeginOperation("start", PhaseStarting);
         try
         {
             ClearStalePidFileIfNeeded();
@@ -46,7 +107,7 @@ public sealed class OpenVpnProcessService(
             if (existing is { } pid)
             {
                 EnsurePidFileMatches(pid);
-                return BuildStatus("start", pid, $"OpenVPN already running (pid {pid}).");
+                return CompleteOperation("start", pid, $"OpenVPN already running (pid {pid}).");
             }
 
             var configPath = RequireConfigPath();
@@ -66,34 +127,54 @@ public sealed class OpenVpnProcessService(
             }
 
             EnsurePidFileMatches(live.Value);
-            return BuildStatus("start", live, $"OpenVPN started (pid {live}, pid file present).");
+            return CompleteOperation("start", live, $"OpenVPN started (pid {live}, pid file present).");
+        }
+        catch (Exception ex) when (ex is not OperationCanceledException)
+        {
+            FailOperation(ex.Message);
+            throw;
         }
         finally
         {
+            ClearInProgress();
             Gate.Release();
         }
     }
 
     public async Task<OpenVpnProcessStatusResponse> KillAsync(CancellationToken cancellationToken)
     {
-        await Gate.WaitAsync(cancellationToken);
+        if (!await Gate.WaitAsync(0, cancellationToken))
+            throw new InvalidOperationException(BusyMessage);
+
+        BeginOperation("kill", PhaseStopping);
         try
         {
-            return await KillUnlockedAsync(cancellationToken);
+            return await KillUnlockedAsync(cancellationToken, completeAs: "kill");
+        }
+        catch (Exception ex) when (ex is not OperationCanceledException)
+        {
+            FailOperation(ex.Message);
+            throw;
         }
         finally
         {
+            ClearInProgress();
             Gate.Release();
         }
     }
 
     public async Task<OpenVpnProcessStatusResponse> RestartAsync(CancellationToken cancellationToken)
     {
-        await Gate.WaitAsync(cancellationToken);
+        if (!await Gate.WaitAsync(0, cancellationToken))
+            throw new InvalidOperationException(BusyMessage);
+
+        BeginOperation("restart", PhaseRestarting);
         try
         {
-            await KillUnlockedAsync(cancellationToken);
+            SetPhase(PhaseStopping);
+            await KillUnlockedAsync(cancellationToken, completeAs: null);
 
+            SetPhase(PhaseStarting);
             var configPath = RequireConfigPath();
             var pidFile = PidFilePath();
             EnsurePidFileDirectory(pidFile);
@@ -109,15 +190,24 @@ public sealed class OpenVpnProcessService(
             }
 
             EnsurePidFileMatches(live.Value);
-            return BuildStatus("restart", live, $"OpenVPN restarted (pid {live}, pid file present).");
+            return CompleteOperation("restart", live, $"OpenVPN restarted (pid {live}, pid file present).");
+        }
+        catch (Exception ex) when (ex is not OperationCanceledException)
+        {
+            FailOperation(ex.Message);
+            throw;
         }
         finally
         {
+            ClearInProgress();
             Gate.Release();
         }
     }
 
-    private async Task<OpenVpnProcessStatusResponse> KillUnlockedAsync(CancellationToken cancellationToken)
+    /// <param name="completeAs">When set, records a completed operation (kill). Null when used as restart mid-step.</param>
+    private async Task<OpenVpnProcessStatusResponse> KillUnlockedAsync(
+        CancellationToken cancellationToken,
+        string? completeAs)
     {
         ClearStalePidFileIfNeeded();
         var pid = ResolveRunningPid();
@@ -130,7 +220,10 @@ public sealed class OpenVpnProcessService(
                     "OpenVPN pid was unknown, but a matching openvpn process is still visible; refuse to claim stopped.");
             }
 
-            return BuildStatus("kill", null, "OpenVPN was not running.");
+            var already = BuildStatus("kill", null, "OpenVPN was not running.");
+            if (completeAs is not null)
+                return CompleteOperation(completeAs, null, already.Message);
+            return already;
         }
 
         logger.LogWarning("Killing OpenVPN pid={Pid} (clients will disconnect)", pid);
@@ -158,7 +251,10 @@ public sealed class OpenVpnProcessService(
                 $"OpenVPN process stopped, but pid file could not be removed: '{PidFilePath()}'.");
         }
 
-        return BuildStatus("kill", null, $"OpenVPN stopped (pid {pid} exited, pid file removed).");
+        var message = $"OpenVPN stopped (pid {pid} exited, pid file removed).";
+        if (completeAs is not null)
+            return CompleteOperation(completeAs, null, message);
+        return BuildStatus("kill", null, message);
     }
 
     private async Task<int?> WaitUntilRunningAsync(int startedPid, TimeSpan timeout, CancellationToken ct)
@@ -256,6 +352,15 @@ public sealed class OpenVpnProcessService(
         TryClearPidFile();
     }
 
+    /// <summary>Best-effort pid peek without clearing stale files (used when gate is busy).</summary>
+    private int? ResolveRunningPidUnsafe()
+    {
+        var pidFile = PidFilePath();
+        if (LinuxOpenVpnProcessRunner.TryReadPidFile(pidFile, out var fromFile) && runner.IsProcessAlive(fromFile))
+            return fromFile;
+        return FindMatchingOpenVpnProcesses().FirstOrDefault()?.Pid;
+    }
+
     private int? ResolveRunningPid()
     {
         var pidFile = PidFilePath();
@@ -276,9 +381,109 @@ public sealed class OpenVpnProcessService(
             .ToList();
     }
 
+    private static void BeginOperation(string operation, string phase)
+    {
+        lock (OpLock)
+        {
+            OpInProgress = true;
+            CurrentOp = operation;
+            CurrentPhase = phase;
+            OpStartedAtUtc = DateTime.UtcNow;
+            LastError = null;
+        }
+    }
+
+    private static void SetPhase(string phase)
+    {
+        lock (OpLock)
+        {
+            CurrentPhase = phase;
+        }
+    }
+
+    private OpenVpnProcessStatusResponse CompleteOperation(string operation, int? pid, string message)
+    {
+        lock (OpLock)
+        {
+            OpInProgress = false;
+            CurrentOp = null;
+            OpStartedAtUtc = null;
+            LastCompletedOp = operation;
+            LastCompletedAtUtc = DateTime.UtcNow;
+            LastError = null;
+            CurrentPhase = pid is not null ? PhaseRunning : PhaseStopped;
+        }
+
+        return BuildStatus(operation, pid, message);
+    }
+
+    private static void FailOperation(string error)
+    {
+        lock (OpLock)
+        {
+            LastError = error;
+            CurrentPhase = PhaseFailed;
+            LastCompletedOp = CurrentOp;
+            LastCompletedAtUtc = DateTime.UtcNow;
+        }
+    }
+
+    private static void ClearInProgress()
+    {
+        lock (OpLock)
+        {
+            OpInProgress = false;
+            CurrentOp = null;
+            OpStartedAtUtc = null;
+            if (CurrentPhase is PhaseStarting or PhaseStopping or PhaseRestarting)
+                CurrentPhase = PhaseIdle;
+        }
+    }
+
+    private string BuildInProgressMessage(int? pid)
+    {
+        string op;
+        string phase;
+        DateTime? started;
+        lock (OpLock)
+        {
+            op = CurrentOp ?? "operation";
+            phase = CurrentPhase;
+            started = OpStartedAtUtc;
+        }
+
+        var since = started is { } t ? $" since {t:HH:mm:ss} UTC" : "";
+        var daemon = pid is { } p ? $"daemon still up (pid {p})" : "daemon currently down";
+        return $"OpenVPN {op} in progress ({phase}{since}); {daemon}.";
+    }
+
     private OpenVpnProcessStatusResponse BuildStatus(string action, int? pid, string? message = null)
     {
         var running = pid is { } p && runner.IsProcessAlive(p);
+        bool inProgress;
+        string phase;
+        string? currentOp;
+        DateTime? opStarted;
+        string? lastOp;
+        DateTime? lastAt;
+        string? lastError;
+        lock (OpLock)
+        {
+            inProgress = OpInProgress;
+            currentOp = CurrentOp;
+            opStarted = OpStartedAtUtc;
+            lastOp = LastCompletedOp;
+            lastAt = LastCompletedAtUtc;
+            lastError = LastError;
+            phase = inProgress
+                ? CurrentPhase
+                : CurrentPhase is PhaseFailed
+                    ? PhaseFailed
+                    : running
+                        ? PhaseRunning
+                        : PhaseStopped;
+        }
+
         return new OpenVpnProcessStatusResponse
         {
             Action = action,
@@ -286,7 +491,14 @@ public sealed class OpenVpnProcessService(
             Pid = running ? pid : null,
             ConfigPath = ConfigPath(),
             PidFilePath = PidFilePath(),
-            Message = message ?? (running ? "OpenVPN is running." : "OpenVPN is not running.")
+            Message = message ?? (running ? "OpenVPN is running." : "OpenVPN is not running."),
+            OperationInProgress = inProgress,
+            Phase = phase,
+            CurrentOperation = currentOp,
+            OperationStartedAtUtc = opStarted,
+            LastCompletedOperation = lastOp,
+            LastCompletedAtUtc = lastAt,
+            LastError = lastError
         };
     }
 

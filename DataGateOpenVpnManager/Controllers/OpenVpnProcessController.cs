@@ -1,5 +1,6 @@
 using DataGateMonitor.SharedModels.DataGateOpenVpnManager.OpenVpnProcess.Responses;
 using DataGateMonitor.SharedModels.Responses;
+using DataGateOpenVpnManager.Services;
 using DataGateOpenVpnManager.Services.Interfaces;
 using Microsoft.AspNetCore.Mvc;
 
@@ -8,6 +9,7 @@ namespace DataGateOpenVpnManager.Controllers;
 /// <summary>
 /// Controls the OpenVPN daemon process inside this container (start / restart / kill).
 /// Requires microservice JWT. Disconnects all VPN clients on kill/restart.
+/// Concurrent mutate calls are rejected with 409 while another operation holds the gate.
 /// </summary>
 [ApiController]
 [Route("api/openvpn")]
@@ -21,11 +23,11 @@ public class OpenVpnProcessController(IOpenVpnProcessService processService) : C
         try
         {
             var status = await processService.GetStatusAsync(cancellationToken);
-            return Ok(ApiResponse<OpenVpnProcessStatusResponse>.SuccessResponse(status));
+            return Ok(ApiResponse<OpenVpnProcessStatusResponse>.SuccessResponse(status, status.Message));
         }
         catch (InvalidOperationException ex)
         {
-            return BadRequest(ApiResponse<OpenVpnProcessStatusResponse>.ErrorResponse(ex.Message));
+            return MapInvalidOperation(ex);
         }
     }
 
@@ -37,7 +39,7 @@ public class OpenVpnProcessController(IOpenVpnProcessService processService) : C
         try
         {
             var status = await processService.StartAsync(cancellationToken);
-            return Ok(ApiResponse<OpenVpnProcessStatusResponse>.SuccessResponse(status));
+            return Ok(ApiResponse<OpenVpnProcessStatusResponse>.SuccessResponse(status, status.Message));
         }
         catch (FileNotFoundException ex)
         {
@@ -45,7 +47,7 @@ public class OpenVpnProcessController(IOpenVpnProcessService processService) : C
         }
         catch (InvalidOperationException ex)
         {
-            return BadRequest(ApiResponse<OpenVpnProcessStatusResponse>.ErrorResponse(ex.Message));
+            return MapInvalidOperation(ex);
         }
     }
 
@@ -57,7 +59,7 @@ public class OpenVpnProcessController(IOpenVpnProcessService processService) : C
         try
         {
             var status = await processService.RestartAsync(cancellationToken);
-            return Ok(ApiResponse<OpenVpnProcessStatusResponse>.SuccessResponse(status));
+            return Ok(ApiResponse<OpenVpnProcessStatusResponse>.SuccessResponse(status, status.Message));
         }
         catch (FileNotFoundException ex)
         {
@@ -65,7 +67,7 @@ public class OpenVpnProcessController(IOpenVpnProcessService processService) : C
         }
         catch (InvalidOperationException ex)
         {
-            return BadRequest(ApiResponse<OpenVpnProcessStatusResponse>.ErrorResponse(ex.Message));
+            return MapInvalidOperation(ex);
         }
     }
 
@@ -77,11 +79,20 @@ public class OpenVpnProcessController(IOpenVpnProcessService processService) : C
         try
         {
             var status = await processService.KillAsync(cancellationToken);
-            return Ok(ApiResponse<OpenVpnProcessStatusResponse>.SuccessResponse(status));
+            return Ok(ApiResponse<OpenVpnProcessStatusResponse>.SuccessResponse(status, status.Message));
         }
         catch (InvalidOperationException ex)
         {
-            return BadRequest(ApiResponse<OpenVpnProcessStatusResponse>.ErrorResponse(ex.Message));
+            return MapInvalidOperation(ex);
         }
+    }
+
+    private static ActionResult<ApiResponse<OpenVpnProcessStatusResponse>> MapInvalidOperation(
+        InvalidOperationException ex)
+    {
+        var body = ApiResponse<OpenVpnProcessStatusResponse>.ErrorResponse(ex.Message);
+        if (string.Equals(ex.Message, OpenVpnProcessService.BusyMessage, StringComparison.Ordinal))
+            return new ConflictObjectResult(body);
+        return new BadRequestObjectResult(body);
     }
 }

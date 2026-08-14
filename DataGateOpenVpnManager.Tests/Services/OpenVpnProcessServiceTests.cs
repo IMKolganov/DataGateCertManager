@@ -6,6 +6,7 @@ using Moq;
 
 namespace DataGateOpenVpnManager.Tests.Services;
 
+[Collection(nameof(OpenVpnProcessServiceTests))]
 public class OpenVpnProcessServiceTests : IDisposable
 {
     private readonly string _dataDir = Path.Combine(Path.GetTempPath(), "ovpn-proc-" + Guid.NewGuid().ToString("N"));
@@ -13,12 +14,14 @@ public class OpenVpnProcessServiceTests : IDisposable
 
     public OpenVpnProcessServiceTests()
     {
+        OpenVpnProcessService.ResetStateForTests();
         Directory.CreateDirectory(_dataDir);
         File.WriteAllText(Path.Combine(_dataDir, "server.conf"), "port 1194\n");
     }
 
     public void Dispose()
     {
+        OpenVpnProcessService.ResetStateForTests();
         if (Directory.Exists(_dataDir))
             Directory.Delete(_dataDir, recursive: true);
     }
@@ -208,6 +211,73 @@ public class OpenVpnProcessServiceTests : IDisposable
         Assert.Equal("22", (await File.ReadAllTextAsync(PidFile)).Trim());
         _runner.Verify(r => r.TrySignal(11, false), Times.Once);
         _runner.Verify(r => r.Start(ConfigFile, PidFile), Times.Once);
+    }
+
+    [Fact]
+    public async Task Kill_WhenAnotherOperationHoldsGate_ThrowsBusy()
+    {
+        await File.WriteAllTextAsync(PidFile, "55");
+        var release = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        var entered = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        var alive = true;
+        _runner.Setup(r => r.IsProcessAlive(55)).Returns(() => alive);
+        _runner.Setup(r => r.FindOpenVpnProcesses()).Returns([]);
+        _runner.Setup(r => r.TrySignal(55, false)).Returns(() =>
+        {
+            entered.TrySetResult();
+            release.Task.GetAwaiter().GetResult();
+            alive = false;
+            return true;
+        });
+
+        var sut = CreateSut();
+        var first = Task.Run(() => sut.KillAsync(CancellationToken.None));
+        await entered.Task.WaitAsync(TimeSpan.FromSeconds(2));
+
+        var busy = await Assert.ThrowsAsync<InvalidOperationException>(() =>
+            sut.KillAsync(CancellationToken.None));
+        Assert.Equal(OpenVpnProcessService.BusyMessage, busy.Message);
+
+        release.TrySetResult();
+        var status = await first;
+        Assert.False(status.IsRunning);
+        Assert.Contains("stopped", status.Message, StringComparison.OrdinalIgnoreCase);
+    }
+
+    [Fact]
+    public async Task Status_WhileKillInProgress_ReportsOperationSnapshot()
+    {
+        await File.WriteAllTextAsync(PidFile, "55");
+        var release = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        var entered = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        var alive = true;
+        _runner.Setup(r => r.IsProcessAlive(55)).Returns(() => alive);
+        _runner.Setup(r => r.FindOpenVpnProcesses()).Returns([]);
+        _runner.Setup(r => r.TrySignal(55, false)).Returns(() =>
+        {
+            entered.TrySetResult();
+            release.Task.GetAwaiter().GetResult();
+            alive = false;
+            return true;
+        });
+
+        var sut = CreateSut();
+        var kill = Task.Run(() => sut.KillAsync(CancellationToken.None));
+        await entered.Task.WaitAsync(TimeSpan.FromSeconds(2));
+
+        var status = await sut.GetStatusAsync(CancellationToken.None);
+        Assert.True(status.OperationInProgress);
+        Assert.Equal("kill", status.CurrentOperation);
+        Assert.Equal(OpenVpnProcessService.PhaseStopping, status.Phase);
+        Assert.Contains("in progress", status.Message, StringComparison.OrdinalIgnoreCase);
+
+        release.TrySetResult();
+        await kill;
+
+        var after = await sut.GetStatusAsync(CancellationToken.None);
+        Assert.False(after.OperationInProgress);
+        Assert.Equal(OpenVpnProcessService.PhaseStopped, after.Phase);
+        Assert.Equal("kill", after.LastCompletedOperation);
     }
 
     [Fact]
