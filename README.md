@@ -72,10 +72,13 @@ Environment variables:
 | `PROTO`                     | Protocol (`udp` or `tcp`)          | `udp`                |
 | `DATA_DIR`                  | Data directory for config/logs/pki | `/mnt`               |
 | `DNS1`, `DNS2`              | Pushed DNS servers                 | `8.8.8.8`, `8.8.4.4` |
-| `MSSFIX`                    | Optional `push "mssfix N"` to clients (WSS/UDP) | _(unset)_ |
-| `DCO`                       | Enable OpenVPN DCO (`true`/`1`/`yes`) | `false` |
-| `CIPHER`                    | Data-channel cipher                 | `AES-128-GCM` if DCO, else `AES-256-CBC` |
-| `DATA_CIPHERS`              | OpenVPN `data-ciphers` list         | GCM/ChaCha list if DCO, else unset |
+| `CIPHER`                    | Data-channel cipher; rewritten into issued `.ovpn` and `/api/info` | `AES-128-GCM` if DCO, else `AES-256-CBC` |
+| `DATA_CIPHERS`              | OpenVPN `data-ciphers` list; rewritten into issued `.ovpn` / `/api/info` | GCM/ChaCha list if DCO, else unset |
+| `DCO`                       | Enable OpenVPN DCO (`true`/`1`/`yes`); exposed on `/api/info` | `false` |
+| `AUTH`                      | HMAC digest (`auth`); server.conf + issued `.ovpn` / `/api/info` | `SHA256` |
+| `TLS_VERSION_MIN`           | `tls-version-min` on server and issued `.ovpn` / `/api/info` | `1.2` |
+| `CLIENT_VERB`               | Suggested client `.ovpn` `verb` (not server log verb) / `/api/info` | `3` |
+| `MSSFIX`                    | Optional `push "mssfix N"` to clients; exposed on `/api/info` (not duplicated in `.ovpn`) | _(unset)_ |
 | `TUN_DEV`                   | Fixed tun device name (stable ufw/NAT) | _(unset → `dev tun`) |
 | `TUN_IF`                    | Extra FORWARD by iface (optional)   | _(unset)_ |
 | `WAN_IF`                    | WAN iface for MASQUERADE            | `eth0` (auto if missing) |
@@ -202,6 +205,7 @@ services:
       PORT: "1194"
       API_PORT: 5010
       PROTO: udp
+      # OPENVPN_WSS_UDP_PROXY: rust   # optional: native UDP WSS datapath (default: dotnet)
       OpenVpnManagement__Port: "5092"
       OpenVpnManagement__Host: "localhost"
       BACKEND__BASEURL: "http://backend:5581/"

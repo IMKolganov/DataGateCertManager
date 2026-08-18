@@ -1,0 +1,14 @@
+# Side-by-side with openvpn-udp-wss (host network → same OpenVPN :1194).
+# Listen :5013. Point a temporary nginx server_name / location here for A/B.
+services:
+  wss-udp-proxy-rs:
+    build: .
+    image: imkolganov/datagate-wss-udp-proxy-rs:latest
+    container_name: wss-udp-proxy-rs
+    restart: unless-stopped
+    network_mode: host
+    environment:
+      LISTEN: "0.0.0.0:5013"
+      VPN_HOST: "127.0.0.1"
+      PORT: "1194"
+      RUST_LOG: "wss_udp_proxy=info"

@@ -25,5 +25,8 @@ public interface IProxyTrafficFlowService
         DateTime? occurredAtUtc = null);
     IReadOnlyCollection<ProxyTrafficFlowUpdate> BuildBatch(DateTime emittedAtUtc);
 
+    /// <summary>Hot-path counter resolved once per pump (avoids dictionary lookup per packet).</summary>
+    IProxyFlowCounter? GetCounter(string connectionId);
+
     bool TryGetIdentityByLocalProxy(int localProxyPort, string? host, out ProxyTrafficIdentitySnapshot? identity);
 }

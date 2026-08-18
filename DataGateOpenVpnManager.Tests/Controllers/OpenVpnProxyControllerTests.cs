@@ -1,3 +1,4 @@
+using System.Net.Sockets;
 using DataGateOpenVpnManager.Controllers;
 using DataGateOpenVpnManager.Services.Proxy;
 using DataGateOpenVpnManager.Tests.Services.Proxy;
@@ -32,7 +33,70 @@ public class OpenVpnProxyControllerTests
         byteDebug ??= new Mock<IProxyByteDebugService>().Object;
         lifetime ??= new Mock<IProxyConnectionLifetimeService>().Object;
         sessionAudit ??= new NoOpProxySessionAuditService();
-        return new OpenVpnProxyController(config, logger.Object, active, history, trafficFlow, identityResolver, byteDebug, lifetime, sessionAudit);
+        return new OpenVpnProxyController(
+            config, logger.Object, active, history, trafficFlow, identityResolver, byteDebug, lifetime, sessionAudit,
+            new ProxyBatchBufferPool());
+    }
+
+    [Theory]
+    [InlineData("udp", "tcp", "udp")]
+    [InlineData("TCP", "udp", "tcp")]
+    [InlineData(null, "udp", "udp")]
+    [InlineData("", "udp", "udp")]
+    [InlineData("  ", "tcp", "tcp")]
+    [InlineData(null, null, "tcp")]
+    [InlineData(null, "weird", "tcp")]
+    public void ResolveProxyMode_PrefersQuery_ThenProto(string? query, string? proto, string expected)
+    {
+        Assert.Equal(expected, OpenVpnProxyController.ResolveProxyMode(query, proto));
+    }
+
+    [Theory]
+    [InlineData("tcp", "udp", OpenVpnProxyProtocolGuard.UdpOnlyMessage)]
+    [InlineData("udp", "tcp", OpenVpnProxyProtocolGuard.TcpOnlyMessage)]
+    [InlineData("TCP", "UDP", OpenVpnProxyProtocolGuard.UdpOnlyMessage)]
+    public void TryGetMismatchMessage_WhenClientHitsWrongProto_ReturnsChannelError(
+        string query, string proto, string expected)
+    {
+        Assert.True(OpenVpnProxyProtocolGuard.TryGetMismatchMessage(query, proto, out var message));
+        Assert.Equal(expected, message);
+    }
+
+    [Theory]
+    [InlineData(null, "udp")]
+    [InlineData("", "tcp")]
+    [InlineData("tcp", "tcp")]
+    [InlineData("udp", "udp")]
+    public void TryGetMismatchMessage_WhenModeMatchesOrOmitted_IsFalse(string? query, string proto)
+    {
+        Assert.False(OpenVpnProxyProtocolGuard.TryGetMismatchMessage(query, proto, out var message));
+        Assert.Equal(string.Empty, message);
+    }
+
+    [Fact]
+    public void ClientMessageForConnectFailure_TcpRefusedOnUdpNode_ReturnsUdpOnly()
+    {
+        var refused = new SocketException((int)SocketError.ConnectionRefused);
+        var message = OpenVpnProxyProtocolGuard.ClientMessageForConnectFailure("tcp", "udp", refused);
+        Assert.Equal(OpenVpnProxyProtocolGuard.UdpOnlyMessage, message);
+        Assert.True(OpenVpnProxyProtocolGuard.IsProtocolMismatchConnectFailure("tcp", "udp", refused));
+    }
+
+    [Fact]
+    public void ClientMessageForConnectFailure_TcpRefusedOnTcpNode_StaysConnectFailed()
+    {
+        var refused = new SocketException((int)SocketError.ConnectionRefused);
+        var message = OpenVpnProxyProtocolGuard.ClientMessageForConnectFailure("tcp", "tcp", refused);
+        Assert.Equal(OpenVpnProxyProtocolGuard.TcpConnectFailedMessage, message);
+        Assert.False(OpenVpnProxyProtocolGuard.IsProtocolMismatchConnectFailure("tcp", "tcp", refused));
+    }
+
+    [Fact]
+    public void ClientMessageForConnectFailure_UdpRefusedOnTcpNode_ReturnsTcpOnly()
+    {
+        var refused = new SocketException((int)SocketError.ConnectionRefused);
+        var message = OpenVpnProxyProtocolGuard.ClientMessageForConnectFailure("udp", "tcp", refused);
+        Assert.Equal(OpenVpnProxyProtocolGuard.TcpOnlyMessage, message);
     }
 
     [Fact]

@@ -1,4 +1,5 @@
-﻿using DataGateOpenVpnManager.Models;
+﻿using DataGateOpenVpnManager.Helpers;
+using DataGateOpenVpnManager.Models;
 using DataGateOpenVpnManager.Services.EasyRsaServices.Interfaces;
 using DataGateOpenVpnManager.Services.Interfaces;
 using DataGateMonitor.SharedModels.DataGateOpenVpnManager.OvpnFile.Responses;
@@ -10,7 +11,8 @@ public class OvpnFileService(
     ILogger<IOvpnFileService> logger,
     IEasyRsaService easyRsaService,
     IOptions<EasyRsaOptions> options,
-    IOvpnIssuanceTracker issuanceTracker)
+    IOvpnIssuanceTracker issuanceTracker,
+    IConfiguration configuration)
     : IOvpnFileService
 {
     public async Task<OvpnFileMetadata> AddOvpnFile(string easyRsaPath, string commonName, string friendlyΝame,
@@ -180,7 +182,7 @@ public class OvpnFileService(
             .Append("-----END CERTIFICATE-----"));
     }
     
-    private static string GenerateOvpnFile(
+    private string GenerateOvpnFile(
         string configTemplate,
         string friendlyΝame,
         string serverIp,
@@ -203,7 +205,7 @@ public class OvpnFileService(
         if (string.IsNullOrWhiteSpace(tlsAuthKey))
             throw new ArgumentNullException(nameof(tlsAuthKey));
 
-        return configTemplate
+        var content = configTemplate
             .Replace("{{friendly_name}}", friendlyΝame)
             .Replace("{{server_ip}}", serverIp)
             .Replace("{{server_port}}", serverPort.ToString())
@@ -211,5 +213,8 @@ public class OvpnFileService(
             .Replace("{{client_cert}}", clientCert)
             .Replace("{{client_key}}", clientKey)
             .Replace("{{tls_auth_key}}", tlsAuthKey);
+
+        // Align client directives with live node env (same defaults as entrypoint.sh).
+        return OvpnClientTemplateSync.Apply(content, OvpnNodeClientSettings.FromConfiguration(configuration));
     }
 }

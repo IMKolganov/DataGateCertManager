@@ -15,6 +15,7 @@ public static class ProxyConfiguration
         services.AddSingleton<IActiveProxyConnectionService, ActiveProxyConnectionService>();
         services.AddSingleton<IProxyConnectionIdentityResolver, ProxyConnectionIdentityResolver>();
         services.AddSingleton<IProxyTrafficFlowService, ProxyTrafficFlowService>();
+        services.AddSingleton<ProxyBatchBufferPool>();
         services.AddSingleton<IProxyConnectionLifetimeService, ProxyConnectionLifetimeService>();
         services.AddSingleton<IProxySessionAuditService, ProxySessionAuditService>();
         services.AddSingleton<IOpenVpnManagementStatusCache, OpenVpnManagementStatusCache>();

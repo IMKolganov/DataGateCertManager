@@ -22,14 +22,29 @@ MSSFIX="${MSSFIX:-}"
 # Cipher: override with CIPHER / DATA_CIPHERS. DCO needs AEAD (GCM/ChaCha), not CBC.
 CIPHER="${CIPHER:-}"
 DATA_CIPHERS="${DATA_CIPHERS:-}"
+AUTH="${AUTH:-SHA256}"
+TLS_VERSION_MIN="${TLS_VERSION_MIN:-1.2}"
+# Client .ovpn verb (server log verb stays separate).
+CLIENT_VERB="${CLIENT_VERB:-3}"
+export AUTH TLS_VERSION_MIN CLIENT_VERB
+# UDP WebSocket datapath: "dotnet" (default) or "rust" (native proxy behind local nginx front).
+OPENVPN_WSS_UDP_PROXY="${OPENVPN_WSS_UDP_PROXY:-dotnet}"
+INTERNAL_DOTNET_PORT="${INTERNAL_DOTNET_PORT:-18080}"
+INTERNAL_RUST_PORT="${INTERNAL_RUST_PORT:-18081}"
 
 EASYRSA_DIR="$DATA_DIR/easy-rsa"
 SCRIPT_SOURCE="/scripts"
 
-# .NET port
-if [ -n "$API_PORT" ]; then
+# .NET listen port — public API_PORT, or loopback when rust front owns API_PORT.
+if [ "${OPENVPN_WSS_UDP_PROXY}" = "rust" ]; then
+  unset ASPNETCORE_HTTP_PORTS || true
+  unset ASPNETCORE_URLS || true
+  export OPENVPN_WSS_UDP_PROXY=rust
+  export INTERNAL_DOTNET_PORT
+  echo "[entrypoint] OPENVPN_WSS_UDP_PROXY=rust → .NET on 127.0.0.1:${INTERNAL_DOTNET_PORT}, Rust on 127.0.0.1:${INTERNAL_RUST_PORT}, nginx on ${API_PORT}"
+elif [ -n "$API_PORT" ]; then
   export ASPNETCORE_HTTP_PORTS="$API_PORT"
-  echo "[entrypoint] Set ASPNETCORE_HTTP_PORTS to $ASPNETCORE_HTTP_PORTS"
+  echo "[entrypoint] Set ASPNETCORE_HTTP_PORTS to $ASPNETCORE_HTTP_PORTS (OPENVPN_WSS_UDP_PROXY=${OPENVPN_WSS_UDP_PROXY})"
 fi
 
 echo "===== STARTING OPENVPN CONTAINER ====="
@@ -174,7 +189,9 @@ cipher $CIPHER"
 else
   CIPHER_LINES="cipher $CIPHER"
 fi
-echo "[entrypoint] DCO=${DCO:-false} cipher=$CIPHER data-ciphers=${DATA_CIPHERS:-<none>}"
+echo "[entrypoint] DCO=${DCO:-false} cipher=$CIPHER data-ciphers=${DATA_CIPHERS:-<none>} auth=$AUTH tls-version-min=$TLS_VERSION_MIN"
+# Make resolved crypto visible to DataGateOpenVpnManager (/api/info + .ovpn issue).
+export CIPHER DATA_CIPHERS DCO
 
 MSSFIX_LINE=""
 if [ -n "$MSSFIX" ]; then
@@ -214,11 +231,11 @@ ${MSSFIX_LINE}
 keepalive 15 120
 
 remote-cert-tls client
-tls-version-min 1.2
+tls-version-min $TLS_VERSION_MIN
 tls-crypt /etc/openvpn/ta.key
 
 $CIPHER_LINES
-auth SHA256
+auth $AUTH
 
 user nobody
 group nogroup
@@ -334,13 +351,133 @@ runuser -u nobody -- cat "$EASYRSA_DIR/pki/crl.pem" >/dev/null \
 echo "✅ Found required .NET files"
 cd /app
 
+write_rust_front_nginx_conf() {
+  cat > /tmp/wss-udp-front.conf <<EOF
+daemon off;
+worker_processes auto;
+error_log /dev/stderr warn;
+pid /tmp/nginx-wss-front.pid;
+
+events {
+    worker_connections 4096;
+}
+
+http {
+    access_log off;
+    client_max_body_size 0;
+
+    map \$http_upgrade \$connection_upgrade {
+        default upgrade;
+        ''      close;
+    }
+
+    map \$arg_mode \$ovpn_proxy_upstream {
+        default http://127.0.0.1:${INTERNAL_DOTNET_PORT};
+        udp     http://127.0.0.1:${INTERNAL_RUST_PORT};
+    }
+
+    server {
+        listen ${API_PORT};
+        server_name _;
+
+        location = /healthz {
+            proxy_pass http://127.0.0.1:${INTERNAL_RUST_PORT}/healthz;
+        }
+
+        location = /version {
+            proxy_pass http://127.0.0.1:${INTERNAL_RUST_PORT}/version;
+        }
+
+        location /api/proxy {
+            proxy_pass \$ovpn_proxy_upstream;
+            proxy_http_version 1.1;
+            proxy_set_header Upgrade \$http_upgrade;
+            proxy_set_header Connection \$connection_upgrade;
+            proxy_set_header Host \$host;
+            proxy_set_header X-Real-IP \$remote_addr;
+            proxy_set_header X-Forwarded-For \$proxy_add_x_forwarded_for;
+            proxy_set_header X-Forwarded-Proto \$scheme;
+            proxy_set_header Authorization \$http_authorization;
+            proxy_read_timeout 86400s;
+            proxy_send_timeout 86400s;
+            proxy_buffering off;
+            proxy_request_buffering off;
+            proxy_socket_keepalive on;
+            tcp_nodelay on;
+        }
+
+        location / {
+            proxy_pass http://127.0.0.1:${INTERNAL_DOTNET_PORT};
+            proxy_http_version 1.1;
+            proxy_set_header Upgrade \$http_upgrade;
+            proxy_set_header Connection \$connection_upgrade;
+            proxy_set_header Host \$host;
+            proxy_set_header X-Real-IP \$remote_addr;
+            proxy_set_header X-Forwarded-For \$proxy_add_x_forwarded_for;
+            proxy_set_header X-Forwarded-Proto \$scheme;
+            proxy_set_header Authorization \$http_authorization;
+            proxy_read_timeout 86400s;
+            proxy_send_timeout 86400s;
+            proxy_buffering off;
+        }
+    }
+}
+EOF
+}
+
+RUST_PID=""
+NGINX_FRONT_PID=""
+
+if [ "${OPENVPN_WSS_UDP_PROXY}" = "rust" ]; then
+  if [ ! -x /usr/local/bin/wss-udp-proxy ]; then
+    echo "❌ OPENVPN_WSS_UDP_PROXY=rust but /usr/local/bin/wss-udp-proxy is missing"
+    exit 1
+  fi
+
+  echo "[entrypoint] Starting Rust WSS↔UDP proxy on 127.0.0.1:${INTERNAL_RUST_PORT} → ${PORT}/udp"
+  LISTEN="127.0.0.1:${INTERNAL_RUST_PORT}" \
+    VPN_HOST="127.0.0.1" \
+    PORT="${PORT}" \
+    RUST_LOG="${RUST_LOG:-wss_udp_proxy=info}" \
+    /usr/local/bin/wss-udp-proxy &
+  RUST_PID=$!
+
+  # Wait briefly so /version is queryable for ops checks.
+  for _ in 1 2 3 4 5 6 7 8 9 10; do
+    if curl -sf "http://127.0.0.1:${INTERNAL_RUST_PORT}/version" >/tmp/wss-udp-proxy.version 2>/dev/null; then
+      echo "[entrypoint] Rust proxy version: $(tr -d '\n' </tmp/wss-udp-proxy.version)"
+      break
+    fi
+    sleep 0.2
+  done
+
+  write_rust_front_nginx_conf
+  echo "[entrypoint] Starting nginx front on :${API_PORT}"
+  nginx -c /tmp/wss-udp-front.conf &
+  NGINX_FRONT_PID=$!
+fi
+
 dotnet DataGateOpenVpnManager.dll &
 DOTNET_PID=$!
+
+if [ "${OPENVPN_WSS_UDP_PROXY}" = "rust" ]; then
+  sleep 1
+  echo "[entrypoint] public /version → $(curl -sf "http://127.0.0.1:${API_PORT}/version" 2>/dev/null || echo 'unavailable')"
+fi
 
 # Keep container alive on the .NET manager. OpenVPN may be killed/restarted via
 # POST /api/openvpn/{start|restart|kill} without exiting the container.
 wait $DOTNET_PID
 DOTNET_EXIT_CODE=$?
+
+if [ -n "$NGINX_FRONT_PID" ] && kill -0 "$NGINX_FRONT_PID" 2>/dev/null; then
+  echo "[entrypoint] Stopping nginx front pid=$NGINX_FRONT_PID"
+  kill "$NGINX_FRONT_PID" 2>/dev/null || true
+fi
+if [ -n "$RUST_PID" ] && kill -0 "$RUST_PID" 2>/dev/null; then
+  echo "[entrypoint] Stopping Rust proxy pid=$RUST_PID"
+  kill "$RUST_PID" 2>/dev/null || true
+fi
 
 # Stop OpenVPN (current pid file or original entrypoint pid) when manager exits.
 if [ -f "$DATA_DIR/openvpn.pid" ]; then

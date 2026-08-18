@@ -2,6 +2,7 @@ using DataGateOpenVpnManager.Models;
 using DataGateOpenVpnManager.Services;
 using DataGateOpenVpnManager.Services.EasyRsaServices.Interfaces;
 using DataGateOpenVpnManager.Services.Interfaces;
+using Microsoft.Extensions.Configuration;
 using Microsoft.Extensions.Logging;
 using Microsoft.Extensions.Options;
 using Moq;
@@ -24,8 +25,9 @@ public class OvpnFileServiceTests
         _issuanceTrackerMock.Setup(t => t.Begin(It.IsAny<string>())).Returns(lease.Object);
     }
 
-    private OvpnFileService CreateService() =>
-        new(_loggerMock.Object, _easyRsaMock.Object, _options, _issuanceTrackerMock.Object);
+    private OvpnFileService CreateService(IConfiguration? configuration = null) =>
+        new(_loggerMock.Object, _easyRsaMock.Object, _options, _issuanceTrackerMock.Object,
+            configuration ?? new ConfigurationBuilder().AddInMemoryCollection().Build());
 
     [Fact]
     public async Task RevokeOvpnFile_WhenFileExists_MovesFileAndReturnsMetadata()

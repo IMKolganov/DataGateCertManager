@@ -1,0 +1,27 @@
+[package]
+name = "wss-udp-proxy"
+version = "0.1.1"
+edition = "2021"
+description = "High-throughput OpenVPN-over-WebSocket UDP proxy (wire-compatible with DataGateOpenVpnManager)"
+publish = false
+
+[dependencies]
+axum = { version = "0.8", features = ["ws"] }
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "sync", "signal", "io-util", "time", "process"] }
+futures-util = "0.3"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+bytes = "1"
+serde = { version = "1", features = ["derive"] }
+socket2 = "0.6"
+
+[dev-dependencies]
+tokio-tungstenite = "0.29"
+futures-util = "0.3"
+http = "1"
+
+[profile.release]
+lto = true
+codegen-units = 1
+opt-level = 3
+strip = true
