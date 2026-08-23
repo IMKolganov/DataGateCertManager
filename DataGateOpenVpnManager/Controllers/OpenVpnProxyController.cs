@@ -1,6 +1,8 @@
+using System.Buffers;
 using System.Net;
 using System.Net.Sockets;
 using System.Net.WebSockets;
+using System.Threading.Channels;
 using DataGateOpenVpnManager.Services.Proxy;
 using DataGateMonitor.SharedModels.DataGateOpenVpnManager.Proxy;
 using DataGateMonitor.SharedModels.DataGateOpenVpnManager.Proxy.Enums;
@@ -22,10 +24,12 @@ public class OpenVpnProxyController(
     IProxyConnectionIdentityResolver identityResolver,
     IProxyByteDebugService proxyByteDebug,
     IProxyConnectionLifetimeService connectionLifetime,
-    IProxySessionAuditService sessionAudit) : ControllerBase
+    IProxySessionAuditService sessionAudit,
+    ProxyBatchBufferPool batchBufferPool) : ControllerBase
 {
-    private const int MaxUdpDatagramSize = 64 * 1024;
-    private const int WsSegmentSize = 16 * 1024;
+    private const int WsSegmentSize = 64 * 1024;
+    private const int UdpSocketBufferBytes = 4 * 1024 * 1024;
+    private const int UdpSendQueueDepth = 4;
 
     /// <summary>
     /// Resolves the real WebSocket client address by the local ephemeral port of the socket
@@ -67,18 +71,30 @@ public class OpenVpnProxyController(
     [HttpGet]
     public async Task Get([FromQuery] string? mode = null, [FromQuery] string? clientRef = null)
     {
-        if (!HttpContext.WebSockets.IsWebSocketRequest)
-        {
-            HttpContext.Response.StatusCode = StatusCodes.Status400BadRequest;
-            await HttpContext.Response.WriteAsync("WebSocket request required");
-            return;
-        }
-
         var portRaw = config["PORT"];
         if (!int.TryParse(portRaw, out var vpnPort) || vpnPort <= 0 || vpnPort > 65535)
         {
             HttpContext.Response.StatusCode = StatusCodes.Status500InternalServerError;
             await HttpContext.Response.WriteAsync("VPN port is not configured");
+            return;
+        }
+
+        var nodeProto = OpenVpnProxyProtocolGuard.NormalizeNodeProto(config["PROTO"]);
+        if (OpenVpnProxyProtocolGuard.TryGetMismatchMessage(mode, config["PROTO"], out var mismatchMessage))
+        {
+            var (mismatchClientIp, _) = GetHttpClientAddress();
+            logger.LogWarning(
+                "Proxy protocol mismatch. requested={Requested} supported={Supported} client={ClientIp}",
+                mode, nodeProto, mismatchClientIp ?? "-");
+            HttpContext.Response.StatusCode = StatusCodes.Status400BadRequest;
+            await HttpContext.Response.WriteAsync(mismatchMessage);
+            return;
+        }
+
+        if (!HttpContext.WebSockets.IsWebSocketRequest)
+        {
+            HttpContext.Response.StatusCode = StatusCodes.Status400BadRequest;
+            await HttpContext.Response.WriteAsync("WebSocket request required");
             return;
         }
 
@@ -90,7 +106,7 @@ public class OpenVpnProxyController(
         var ct = HttpContext.RequestAborted;
         using var linkedCts = CancellationTokenSource.CreateLinkedTokenSource(ct);
 
-        var modeNorm = (mode ?? "tcp").Trim().ToLowerInvariant();
+        var modeNorm = OpenVpnProxyProtocolGuard.ResolveTunnelMode(mode, config["PROTO"]);
         var identity = identityResolver.Resolve(HttpContext, clientRef);
         var connectionId = Guid.NewGuid().ToString("N");
         connectionLifetime.Register(connectionId, linkedCts);
@@ -144,9 +160,25 @@ public class OpenVpnProxyController(
         }
         catch (Exception e)
         {
-            logger.LogError(e, "TCP connect failed. {Host}:{Port}. {Message}", targetHost, vpnPort, e.Message);
-            RecordConnectFailed(connectionId, ProxyConnectionProtocol.Tcp, targetHost, vpnPort, e.Message, identity);
-            await TryCloseWs(ws, "TCP connect failed", logger);
+            var (clientIp, clientPort) = GetHttpClientAddress();
+            var nodeProto = OpenVpnProxyProtocolGuard.NormalizeNodeProto(config["PROTO"]);
+            var clientMessage = OpenVpnProxyProtocolGuard.ClientMessageForConnectFailure("tcp", nodeProto, e);
+            var isMismatch = OpenVpnProxyProtocolGuard.IsProtocolMismatchConnectFailure("tcp", nodeProto, e);
+            if (isMismatch)
+            {
+                logger.LogWarning(e,
+                    "TCP connect rejected: channel is {Supported}. {Host}:{Port}. client={ClientIp}:{ClientPort}",
+                    nodeProto, targetHost, vpnPort, clientIp ?? "-", clientPort);
+            }
+            else
+            {
+                logger.LogError(e,
+                    "TCP connect failed. {Host}:{Port}. client={ClientIp}:{ClientPort}. {Message}",
+                    targetHost, vpnPort, clientIp ?? "-", clientPort, e.Message);
+            }
+
+            RecordConnectFailed(connectionId, ProxyConnectionProtocol.Tcp, targetHost, vpnPort, clientMessage, identity);
+            await TryCloseWs(ws, clientMessage, logger);
             return;
         }
 
@@ -160,12 +192,22 @@ public class OpenVpnProxyController(
             using var pumpCts = CancellationTokenSource.CreateLinkedTokenSource(ct);
             var pumpCt = pumpCts.Token;
 
-            var wsToTcp = PumpWebSocketToTcp(ws, tcpStream, pumpCt, logger, connectionId, proxyTrafficFlow);
-            var tcpToWs = PumpTcpToWebSocket(ws, tcpStream, pumpCt, logger, connectionId, proxyTrafficFlow);
+            var counter = proxyTrafficFlow.GetCounter(connectionId);
+            var wsToTcp = PumpWebSocketToTcp(ws, tcpStream, pumpCt, logger, counter);
+            var tcpToWs = PumpTcpToWebSocket(ws, tcpStream, pumpCt, logger, counter);
 
             await Task.WhenAny(wsToTcp, tcpToWs);
-            // One direction finished: stop the sibling pump quickly to avoid lingering under load.
-            pumpCts.Cancel();
+            await pumpCts.CancelAsync();
+
+            using var drain = new CancellationTokenSource(TimeSpan.FromSeconds(2));
+            try
+            {
+                await Task.WhenAll(wsToTcp, tcpToWs).WaitAsync(drain.Token);
+            }
+            catch (Exception ex)
+            {
+                logger.LogDebug(ex, "TCP pump drain did not finish in time");
+            }
         }
         finally
         {
@@ -183,128 +225,360 @@ public class OpenVpnProxyController(
         ProxyConnectionIdentity? identity)
     {
         var remote = new IPEndPoint(targetIp, vpnPort);
-
-        using var udp = new UdpClient(0);
+        Socket? socket = null;
         try
         {
-            udp.Connect(remote);
-            logger.LogInformation("UDP proxy started. remote={Remote} local={Local}", remote, udp.Client.LocalEndPoint);
+            socket = CreateVpnUdpSocket(remote, logger);
+            logger.LogInformation("UDP proxy started. remote={Remote} local={Local}", remote, socket.LocalEndPoint);
         }
         catch (Exception e)
         {
-            logger.LogError(e, "UDP connect failed. {Host}:{Port}. {Message}", remote.Address, remote.Port, e.Message);
-            RecordConnectFailed(connectionId, ProxyConnectionProtocol.Udp, remote.Address.ToString(), remote.Port, e.Message, identity);
+            socket?.Dispose();
+            var nodeProto = OpenVpnProxyProtocolGuard.NormalizeNodeProto(config["PROTO"]);
+            var clientMessage = OpenVpnProxyProtocolGuard.ClientMessageForConnectFailure("udp", nodeProto, e);
+            var isMismatch = OpenVpnProxyProtocolGuard.IsProtocolMismatchConnectFailure("udp", nodeProto, e);
+            if (isMismatch)
+            {
+                logger.LogWarning(e,
+                    "UDP connect rejected: channel is {Supported}. {Host}:{Port}. {Message}",
+                    nodeProto, remote.Address, remote.Port, e.Message);
+            }
+            else
+            {
+                logger.LogError(e, "UDP connect failed. {Host}:{Port}. {Message}", remote.Address, remote.Port, e.Message);
+            }
+
+            RecordConnectFailed(connectionId, ProxyConnectionProtocol.Udp, remote.Address.ToString(), remote.Port, clientMessage, identity);
             if (ws.State == WebSocketState.Open)
-                await SafeCloseWs(ws, WebSocketCloseStatus.InternalServerError, "UDP connect failed");
+                await SafeCloseWs(ws, WebSocketCloseStatus.InternalServerError, clientMessage);
             return;
         }
 
-        var localEp = (IPEndPoint)udp.Client.LocalEndPoint!;
-        RegisterActiveConnection(connectionId, ProxyConnectionProtocol.Udp, localEp, remote, identity);
-
-        try
+        using (socket)
         {
-            var wsToUdp = Task.Run(async () =>
+            var localEp = (IPEndPoint)socket.LocalEndPoint!;
+            RegisterActiveConnection(connectionId, ProxyConnectionProtocol.Udp, localEp, remote, identity);
+            var counter = proxyTrafficFlow.GetCounter(connectionId);
+
+            try
             {
+                using var pumpCts = CancellationTokenSource.CreateLinkedTokenSource(ct);
+                var pumpCt = pumpCts.Token;
+
+                var wsToUdp = PumpWebSocketToUdp(ws, socket, pumpCt, logger, counter);
+                var udpToWs = PumpUdpToWebSocket(ws, socket, pumpCt, logger, counter, batchBufferPool);
+
+                await Task.WhenAny(wsToUdp, udpToWs);
+                await pumpCts.CancelAsync();
+
+                using var drain = new CancellationTokenSource(TimeSpan.FromSeconds(2));
                 try
                 {
-                    while (!ct.IsCancellationRequested && ws.State == WebSocketState.Open)
-                    {
-                        var msg = await ReceiveWholeWsMessage(ws, ct);
-                        logger.LogDebug("WS message: type={Type} bytes={Bytes}", msg.MessageType, msg.Payload.Length);
-                        if (msg.MessageType == WebSocketMessageType.Close)
-                            break;
-
-                        if (msg.MessageType == WebSocketMessageType.Text)
-                        {
-                            // Ignore any text control messages
-                            continue;
-                        }
-
-                        if (msg.MessageType != WebSocketMessageType.Binary || msg.Payload.Length == 0)
-                            continue;
-
-                        // Parse one or more datagrams from: [u16_be len][payload]...
-                        var data = msg.Payload;
-                        var off = 0;
-
-                        while (off + 2 <= data.Length)
-                        {
-                            var len = (data[off] << 8) | data[off + 1];
-                            off += 2;
-
-                            if (len <= 0 || off + len > data.Length)
-                            {
-                                logger.LogWarning("Invalid framed UDP message. off={Off} len={Len} total={Total}", off, len,
-                                    data.Length);
-                                break;
-                            }
-
-                            await udp.SendAsync(data.AsMemory(off, len), ct);
-                            proxyTrafficFlow.RecordTraffic(connectionId, ProxyTrafficFlowDirection.ClientToServer, len);
-                            off += len;
-                        }
-                    }
+                    await Task.WhenAll(wsToUdp, udpToWs).WaitAsync(drain.Token);
                 }
-                catch (OperationCanceledException)
+                catch (Exception ex)
                 {
+                    logger.LogDebug(ex, "UDP pump drain did not finish in time");
                 }
-                catch (Exception e)
-                {
-                    logger.LogDebug(e, "WS->UDP pump error. {Message}", e.Message);
-                }
-            }, ct);
-
-            var udpToWs = Task.Run(async () =>
+            }
+            finally
             {
-                try
-                {
-                    while (!ct.IsCancellationRequested && ws.State == WebSocketState.Open)
-                    {
-                        var pkt = await udp.ReceiveAsync(ct);
-                        if (pkt.Buffer.Length <= 0)
-                            continue;
-
-                        if (pkt.Buffer.Length > 65535)
-                            continue;
-
-                        // Frame: [u16_be len][payload]
-                        var framed = new byte[2 + pkt.Buffer.Length];
-                        framed[0] = (byte)((pkt.Buffer.Length >> 8) & 0xFF);
-                        framed[1] = (byte)(pkt.Buffer.Length & 0xFF);
-                        Buffer.BlockCopy(pkt.Buffer, 0, framed, 2, pkt.Buffer.Length);
-
-                        await ws.SendAsync(
-                            framed,
-                            WebSocketMessageType.Binary,
-                            endOfMessage: true,
-                            cancellationToken: ct);
-                        proxyTrafficFlow.RecordTraffic(connectionId, ProxyTrafficFlowDirection.ServerToClient, pkt.Buffer.Length);
-                    }
-                }
-                catch (OperationCanceledException)
-                {
-                }
-                catch (SocketException e)
-                {
-                    logger.LogDebug(e, "UDP receive error. {Message}", e.Message);
-                }
-                catch (Exception e)
-                {
-                    logger.LogDebug(e, "UDP->WS pump error. {Message}", e.Message);
-                }
-            }, ct);
-
-            await Task.WhenAny(wsToUdp, udpToWs);
-        }
-        finally
-        {
-            UnregisterConnection(connectionId);
+                UnregisterConnection(connectionId);
+            }
         }
 
         if (ws.State == WebSocketState.Open)
             await SafeCloseWs(ws, WebSocketCloseStatus.NormalClosure, "Closing");
     }
+
+    private static Socket CreateVpnUdpSocket(IPEndPoint remote, ILogger logger)
+    {
+        var socket = new Socket(AddressFamily.InterNetwork, SocketType.Dgram, ProtocolType.Udp);
+        try
+        {
+            socket.Bind(new IPEndPoint(IPAddress.Loopback, 0));
+            try
+            {
+                socket.ReceiveBufferSize = UdpSocketBufferBytes;
+                socket.SendBufferSize = UdpSocketBufferBytes;
+            }
+            catch (SocketException ex)
+            {
+                logger.LogDebug(ex, "Could not enlarge UDP socket buffers");
+            }
+
+            // Kernel silently clamps to net.core.rmem_max — log so ops can see it.
+            if (socket.ReceiveBufferSize < UdpSocketBufferBytes)
+            {
+                logger.LogWarning(
+                    "UDP SO_RCVBUF clamped to {Actual} (requested {Requested}); raise net.core.rmem_max in the container netns",
+                    socket.ReceiveBufferSize, UdpSocketBufferBytes);
+            }
+
+            socket.Connect(remote);
+            return socket;
+        }
+        catch
+        {
+            socket.Dispose();
+            throw;
+        }
+    }
+
+    /// <summary>
+    /// WS→UDP: framed binary messages <c>[u16_be len][payload]...</c>.
+    /// </summary>
+    private static async Task PumpWebSocketToUdp(
+        WebSocket ws,
+        Socket socket,
+        CancellationToken ct,
+        ILogger logger,
+        IProxyFlowCounter? counter)
+    {
+        var segment = ArrayPool<byte>.Shared.Rent(WsSegmentSize);
+        try
+        {
+            while (!ct.IsCancellationRequested && ws.State == WebSocketState.Open)
+            {
+                var (messageType, payload, payloadLen, ownsPayload) =
+                    await ReceiveWholeWsMessageRented(ws, segment, ct);
+                try
+                {
+                    if (messageType == WebSocketMessageType.Close)
+                        break;
+
+                    if (messageType != WebSocketMessageType.Binary || payloadLen == 0)
+                        continue;
+
+                    var off = 0;
+                    long batchBytes = 0;
+                    while (off + 2 <= payloadLen)
+                    {
+                        var next = UdpWsFraming.TryParseNextFrame(payload.AsSpan(0, payloadLen), off, out var frame);
+                        if (next < 0)
+                        {
+                            logger.LogWarning(
+                                "Invalid framed UDP message. off={Off} total={Total}",
+                                off, payloadLen);
+                            break;
+                        }
+
+                        var frameLen = frame.Length;
+                        await socket.SendAsync(payload.AsMemory(off + 2, frameLen), SocketFlags.None, ct);
+                        batchBytes += frameLen;
+                        off = next;
+                    }
+
+                    if (batchBytes > 0)
+                        counter?.Add(ProxyTrafficFlowDirection.ClientToServer, batchBytes);
+                }
+                finally
+                {
+                    if (ownsPayload)
+                        ArrayPool<byte>.Shared.Return(payload);
+                }
+            }
+        }
+        catch (OperationCanceledException)
+        {
+        }
+        catch (Exception e)
+        {
+            logger.LogDebug(e, "WS->UDP pump error. {Message}", e.Message);
+        }
+        finally
+        {
+            ArrayPool<byte>.Shared.Return(segment);
+        }
+    }
+
+    /// <summary>
+    /// UDP→WS with producer/sender split so batching continues while <see cref="WebSocket.SendAsync"/> is in flight.
+    /// </summary>
+    private static async Task PumpUdpToWebSocket(
+        WebSocket ws,
+        Socket socket,
+        CancellationToken ct,
+        ILogger logger,
+        IProxyFlowCounter? counter,
+        ProxyBatchBufferPool pool)
+    {
+        var channel = Channel.CreateBounded<UdpWsBatch>(
+            new BoundedChannelOptions(UdpSendQueueDepth)
+            {
+                SingleReader = true,
+                SingleWriter = true,
+                // Drop newest under backpressure (UDP-like); TryWrite false → return buffer.
+                FullMode = BoundedChannelFullMode.DropWrite,
+                AllowSynchronousContinuations = false
+            });
+
+        var producer = ProduceUdpBatchesAsync(socket, channel.Writer, pool, ct, logger);
+        var sender = SendUdpBatchesAsync(ws, channel.Reader, pool, counter, ct, logger);
+
+        await Task.WhenAny(producer, sender);
+        channel.Writer.TryComplete();
+        try
+        {
+            await Task.WhenAll(producer, sender);
+        }
+        catch (OperationCanceledException)
+        {
+        }
+        catch (Exception e)
+        {
+            logger.LogDebug(e, "UDP->WS pump error. {Message}", e.Message);
+        }
+    }
+
+    private readonly record struct UdpWsBatch(byte[] Buffer, int Length, long PayloadBytes);
+
+    private static async Task ProduceUdpBatchesAsync(
+        Socket socket,
+        ChannelWriter<UdpWsBatch> writer,
+        ProxyBatchBufferPool pool,
+        CancellationToken ct,
+        ILogger logger)
+    {
+        var scratch = ArrayPool<byte>.Shared.Rent(UdpWsFraming.MaxPayloadLength);
+        try
+        {
+            while (!ct.IsCancellationRequested)
+            {
+                var batch = pool.Rent();
+                var offset = 0;
+                long payloadBytes = 0;
+
+                try
+                {
+                    bool moreQueued;
+                    do
+                    {
+                        var receiveVt = socket.ReceiveAsync(scratch.AsMemory(0, UdpWsFraming.MaxPayloadLength), SocketFlags.None, ct);
+                        moreQueued = receiveVt.IsCompleted;
+
+                        int n;
+                        try
+                        {
+                            n = await receiveVt;
+                        }
+                        catch (SocketException ex) when (IsTransientUdpError(ex.SocketErrorCode))
+                        {
+                            moreQueued = false;
+                            continue;
+                        }
+
+                        if (n is <= 0 or > UdpWsFraming.MaxPayloadLength)
+                        {
+                            moreQueued = false;
+                            continue;
+                        }
+
+                        if (!UdpWsFraming.CanAppendFrame(offset, n, ProxyBatchBufferPool.BufferSize, UdpWsFraming.BatchTargetBytes)
+                            && offset > 0)
+                        {
+                            if (!writer.TryWrite(new UdpWsBatch(batch, offset, payloadBytes)))
+                                pool.Return(batch);
+
+                            batch = pool.Rent();
+                            offset = 0;
+                            payloadBytes = 0;
+                        }
+
+                        if (offset + 2 + n > ProxyBatchBufferPool.BufferSize)
+                        {
+                            // Should be unreachable for n <= MaxPayloadLength once capacity >= MaxFrameBytes.
+                            logger.LogWarning(
+                                "UDP datagram {Size}B dropped: exceeds batch buffer capacity {Capacity}",
+                                n, ProxyBatchBufferPool.BufferSize);
+                            moreQueued = false;
+                            continue;
+                        }
+
+                        offset += UdpWsFraming.WriteFrame(batch.AsSpan(offset), scratch.AsSpan(0, n));
+                        payloadBytes += n;
+                    }
+                    while (moreQueued
+                           && offset < UdpWsFraming.BatchTargetBytes
+                           && offset + 2 + UdpWsFraming.MaxPayloadLength <= ProxyBatchBufferPool.BufferSize
+                           && !ct.IsCancellationRequested);
+
+                    if (offset == 0)
+                    {
+                        pool.Return(batch);
+                        continue;
+                    }
+
+                    if (!writer.TryWrite(new UdpWsBatch(batch, offset, payloadBytes)))
+                        pool.Return(batch);
+                }
+                catch (OperationCanceledException)
+                {
+                    pool.Return(batch);
+                    break;
+                }
+                catch (Exception e)
+                {
+                    pool.Return(batch);
+                    logger.LogDebug(e, "UDP receive/batch error. {Message}", e.Message);
+                    break;
+                }
+            }
+        }
+        finally
+        {
+            ArrayPool<byte>.Shared.Return(scratch);
+            writer.TryComplete();
+        }
+    }
+
+    private static async Task SendUdpBatchesAsync(
+        WebSocket ws,
+        ChannelReader<UdpWsBatch> reader,
+        ProxyBatchBufferPool pool,
+        IProxyFlowCounter? counter,
+        CancellationToken ct,
+        ILogger logger)
+    {
+        try
+        {
+            await foreach (var batch in reader.ReadAllAsync(ct))
+            {
+                try
+                {
+                    if (ws.State != WebSocketState.Open)
+                        break;
+
+                    await ws.SendAsync(
+                        batch.Buffer.AsMemory(0, batch.Length),
+                        WebSocketMessageType.Binary,
+                        endOfMessage: true,
+                        cancellationToken: ct);
+                    if (batch.PayloadBytes > 0)
+                        counter?.Add(ProxyTrafficFlowDirection.ServerToClient, batch.PayloadBytes);
+                }
+                finally
+                {
+                    pool.Return(batch.Buffer);
+                }
+            }
+        }
+        catch (OperationCanceledException)
+        {
+        }
+        catch (Exception e)
+        {
+            logger.LogDebug(e, "UDP->WS send error. {Message}", e.Message);
+        }
+    }
+
+    private static bool IsTransientUdpError(SocketError error) =>
+        error is SocketError.ConnectionRefused
+            or SocketError.ConnectionReset
+            or SocketError.NoBufferSpaceAvailable
+            or SocketError.MessageSize
+            or SocketError.Interrupted
+            or SocketError.WouldBlock;
 
     private void RegisterActiveConnection(
         string connectionId,
@@ -432,6 +706,13 @@ public class OpenVpnProxyController(
         });
     }
 
+    /// <summary>
+    /// Tunnel mode after mismatch rejection: explicit <c>mode</c> if it matches node <c>PROTO</c>,
+    /// otherwise the node protocol (udp-wss must not default to tcp).
+    /// </summary>
+    public static string ResolveProxyMode(string? modeFromQuery, string? protoFromConfig) =>
+        OpenVpnProxyProtocolGuard.ResolveTunnelMode(modeFromQuery, protoFromConfig);
+
     private (string? Ip, int Port) GetHttpClientAddress()
     {
         var ip = ResolveClientIp(HttpContext);
@@ -461,27 +742,55 @@ public class OpenVpnProxyController(
         }
     }
 
-    private sealed record WsWholeMessage(WebSocketMessageType MessageType, byte[] Payload);
-
-    private static async Task<WsWholeMessage> ReceiveWholeWsMessage(WebSocket ws, CancellationToken ct)
+    /// <summary>
+    /// Reassembles a fragmented WS message. When <c>ownsPayload</c> is true, caller must return
+    /// <paramref name="Payload"/> to <see cref="ArrayPool{T}"/> (segment is never returned by caller).
+    /// </summary>
+    private static async Task<(WebSocketMessageType MessageType, byte[] Payload, int PayloadLen, bool OwnsPayload)>
+        ReceiveWholeWsMessageRented(WebSocket ws, byte[] segment, CancellationToken ct)
     {
-        // Reassembles fragmented WebSocket messages into one payload.
-        var buffer = new byte[16 * 1024];
-        using var ms = new MemoryStream();
+        var result = await ws.ReceiveAsync(segment.AsMemory(0, segment.Length), ct);
 
-        WebSocketReceiveResult result;
-        do
+        if (result.MessageType == WebSocketMessageType.Close)
+            return (WebSocketMessageType.Close, Array.Empty<byte>(), 0, false);
+
+        if (result.EndOfMessage)
+            return (result.MessageType, segment, result.Count, false);
+
+        // Fragmented: grow into a rented buffer.
+        var rented = ArrayPool<byte>.Shared.Rent(Math.Max(WsSegmentSize * 2, result.Count + WsSegmentSize));
+        var written = result.Count;
+        Buffer.BlockCopy(segment, 0, rented, 0, result.Count);
+
+        try
         {
-            result = await ws.ReceiveAsync(buffer, ct);
+            do
+            {
+                if (written + WsSegmentSize > rented.Length)
+                {
+                    var bigger = ArrayPool<byte>.Shared.Rent(rented.Length * 2);
+                    Buffer.BlockCopy(rented, 0, bigger, 0, written);
+                    ArrayPool<byte>.Shared.Return(rented);
+                    rented = bigger;
+                }
 
-            if (result.MessageType == WebSocketMessageType.Close)
-                return new WsWholeMessage(WebSocketMessageType.Close, Array.Empty<byte>());
+                result = await ws.ReceiveAsync(rented.AsMemory(written, rented.Length - written), ct);
+                if (result.MessageType == WebSocketMessageType.Close)
+                {
+                    ArrayPool<byte>.Shared.Return(rented);
+                    return (WebSocketMessageType.Close, Array.Empty<byte>(), 0, false);
+                }
 
-            if (result.Count > 0)
-                ms.Write(buffer, 0, result.Count);
-        } while (!result.EndOfMessage);
+                written += result.Count;
+            } while (!result.EndOfMessage);
 
-        return new WsWholeMessage(result.MessageType, ms.ToArray());
+            return (result.MessageType, rented, written, true);
+        }
+        catch
+        {
+            ArrayPool<byte>.Shared.Return(rented);
+            throw;
+        }
     }
 
     private static async Task TryCloseWs(WebSocket ws, string reason, ILogger logger)
@@ -502,16 +811,14 @@ public class OpenVpnProxyController(
         NetworkStream tcp,
         CancellationToken ct,
         ILogger logger,
-        string connectionId,
-        IProxyTrafficFlowService proxyTrafficFlow)
+        IProxyFlowCounter? counter)
     {
-        var buffer = new byte[16 * 1024];
-
+        var buffer = ArrayPool<byte>.Shared.Rent(WsSegmentSize);
         try
         {
             while (!ct.IsCancellationRequested && ws.State == WebSocketState.Open)
             {
-                var result = await ws.ReceiveAsync(buffer, ct);
+                var result = await ws.ReceiveAsync(buffer.AsMemory(0, buffer.Length), ct);
 
                 if (result.MessageType == WebSocketMessageType.Close)
                     break;
@@ -520,20 +827,17 @@ public class OpenVpnProxyController(
                     continue;
 
                 await tcp.WriteAsync(buffer.AsMemory(0, result.Count), ct);
-                proxyTrafficFlow.RecordTraffic(connectionId, ProxyTrafficFlowDirection.ClientToServer, result.Count);
+                counter?.Add(ProxyTrafficFlowDirection.ClientToServer, result.Count);
 
                 while (!result.EndOfMessage)
                 {
-                    result = await ws.ReceiveAsync(buffer, ct);
+                    result = await ws.ReceiveAsync(buffer.AsMemory(0, buffer.Length), ct);
                     if (result.MessageType != WebSocketMessageType.Binary)
                         break;
 
                     await tcp.WriteAsync(buffer.AsMemory(0, result.Count), ct);
-                    proxyTrafficFlow.RecordTraffic(connectionId, ProxyTrafficFlowDirection.ClientToServer, result.Count);
+                    counter?.Add(ProxyTrafficFlowDirection.ClientToServer, result.Count);
                 }
-
-                // NetworkStream flush is typically unnecessary and may hurt throughput/latency.
-                // await tcp.FlushAsync(ct);
             }
         }
         catch (OperationCanceledException ex)
@@ -544,6 +848,10 @@ public class OpenVpnProxyController(
         {
             logger.LogDebug(e, "WS->TCP pump error. {Message}", e.Message);
         }
+        finally
+        {
+            ArrayPool<byte>.Shared.Return(buffer);
+        }
     }
 
     private static async Task PumpTcpToWebSocket(
@@ -551,16 +859,14 @@ public class OpenVpnProxyController(
         NetworkStream tcp,
         CancellationToken ct,
         ILogger logger,
-        string connectionId,
-        IProxyTrafficFlowService proxyTrafficFlow)
+        IProxyFlowCounter? counter)
     {
-        var buffer = new byte[16 * 1024];
-
+        var buffer = ArrayPool<byte>.Shared.Rent(WsSegmentSize);
         try
         {
             while (!ct.IsCancellationRequested && ws.State == WebSocketState.Open)
             {
-                var read = await tcp.ReadAsync(buffer, ct);
+                var read = await tcp.ReadAsync(buffer.AsMemory(0, buffer.Length), ct);
                 if (read <= 0)
                     break;
 
@@ -568,9 +874,8 @@ public class OpenVpnProxyController(
                     buffer.AsMemory(0, read),
                     WebSocketMessageType.Binary,
                     endOfMessage: true,
-                    cancellationToken: ct
-                );
-                proxyTrafficFlow.RecordTraffic(connectionId, ProxyTrafficFlowDirection.ServerToClient, read);
+                    cancellationToken: ct);
+                counter?.Add(ProxyTrafficFlowDirection.ServerToClient, read);
             }
         }
         catch (OperationCanceledException ex)
@@ -580,6 +885,10 @@ public class OpenVpnProxyController(
         catch (Exception e)
         {
             logger.LogDebug(e, "TCP->WS pump error. {Message}", e.Message);
+        }
+        finally
+        {
+            ArrayPool<byte>.Shared.Return(buffer);
         }
     }
 }

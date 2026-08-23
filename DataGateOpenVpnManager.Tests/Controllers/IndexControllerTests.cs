@@ -41,6 +41,13 @@ public class IndexControllerTests
             ["PORT"] = "1194",
             ["API_PORT"] = "5010",
             ["PROTO"] = "udp",
+            ["CIPHER"] = "AES-128-GCM",
+            ["DATA_CIPHERS"] = "AES-128-GCM:AES-256-GCM:CHACHA20-POLY1305",
+            ["DCO"] = "true",
+            ["AUTH"] = "SHA256",
+            ["TLS_VERSION_MIN"] = "1.2",
+            ["MSSFIX"] = "1200",
+            ["CLIENT_VERB"] = "3",
             ["OpenVpnManagement:Host"] = "127.0.0.1",
             ["OpenVpnManagement:Port"] = "5092",
             ["BACKEND__BASEURL"] = "http://backend/"
@@ -64,6 +71,13 @@ public class IndexControllerTests
         Assert.NotNull(response.Data.Config);
         Assert.Equal("8.8.8.8", response.Data.Config.Dns1);
         Assert.Equal("1194", response.Data.Config.Port);
+        Assert.Equal("AES-128-GCM", response.Data.Config.Cipher);
+        Assert.Equal("AES-128-GCM:AES-256-GCM:CHACHA20-POLY1305", response.Data.Config.DataCiphers);
+        Assert.Equal("true", response.Data.Config.Dco);
+        Assert.Equal("SHA256", response.Data.Config.Auth);
+        Assert.Equal("1.2", response.Data.Config.TlsVersionMin);
+        Assert.Equal("1200", response.Data.Config.MssFix);
+        Assert.Equal("3", response.Data.Config.ClientVerb);
         Assert.Equal("5092", response.Data.Config.OpenVpnManagement?.Port);
     }
 
@@ -86,15 +100,24 @@ public class IndexControllerTests
     }
 
     [Fact]
-    public async Task Get_WhenConfigMissingKeys_StillReturnsOk_WithNullOrEmptyConfigValues()
+    public async Task Get_WhenCipherEnvEmpty_AndDcoTrue_DefaultsCipherLikeEntrypoint()
     {
-        var config = new ConfigurationBuilder().AddInMemoryCollection(new Dictionary<string, string?>()).Build();
+        var configData = new Dictionary<string, string?>
+        {
+            ["DCO"] = "true",
+            ["PROTO"] = "udp",
+            ["PORT"] = "1194"
+        };
+        var config = new ConfigurationBuilder().AddInMemoryCollection(configData!).Build();
         var controller = new IndexController(config, _envMock.Object, _loggerMock.Object, _externalIpMock.Object);
 
         var result = await controller.Get(CancellationToken.None);
 
         var okResult = Assert.IsType<OkObjectResult>(result.Result);
         var response = Assert.IsType<ApiResponse<RootOpenVpnInfoResponse>>(okResult.Value);
-        Assert.NotNull(response.Data!.Config);
+        Assert.Equal("AES-128-GCM", response.Data!.Config!.Cipher);
+        Assert.Equal("AES-128-GCM:AES-256-GCM:CHACHA20-POLY1305", response.Data.Config.DataCiphers);
+        Assert.Equal("SHA256", response.Data.Config.Auth);
+        Assert.Equal("1.2", response.Data.Config.TlsVersionMin);
     }
 }

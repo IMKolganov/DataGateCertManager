@@ -47,7 +47,9 @@ public class DiagnosticsController(
         {
             var dnsTarget = config["DNS1"] ?? "10.51.15.1";
             var snapshot = statusCache.GetSnapshot();
-            if (snapshot is null || !snapshot.IsValid)
+            if (ProxyManagementPeerDiagnostics.NeedsRefreshForClientMapping(
+                    snapshot,
+                    proxyOptions.Value.ManagementCacheMaxAge))
             {
                 await statusCache.RefreshAsync(cancellationToken);
                 snapshot = statusCache.GetSnapshot();

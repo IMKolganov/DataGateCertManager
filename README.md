@@ -72,7 +72,16 @@ Environment variables:
 | `PROTO`                     | Protocol (`udp` or `tcp`)          | `udp`                |
 | `DATA_DIR`                  | Data directory for config/logs/pki | `/mnt`               |
 | `DNS1`, `DNS2`              | Pushed DNS servers                 | `8.8.8.8`, `8.8.4.4` |
-| `MSSFIX`                    | Optional `push "mssfix N"` to clients (WSS/UDP) | _(unset)_ |
+| `CIPHER`                    | Data-channel cipher; rewritten into issued `.ovpn` and `/api/info` | `AES-128-GCM` if DCO, else `AES-256-CBC` |
+| `DATA_CIPHERS`              | OpenVPN `data-ciphers` list; rewritten into issued `.ovpn` / `/api/info` | GCM/ChaCha list if DCO, else unset |
+| `DCO`                       | Enable OpenVPN DCO (`true`/`1`/`yes`); exposed on `/api/info` | `false` |
+| `AUTH`                      | HMAC digest (`auth`); server.conf + issued `.ovpn` / `/api/info` | `SHA256` |
+| `TLS_VERSION_MIN`           | `tls-version-min` on server and issued `.ovpn` / `/api/info` | `1.2` |
+| `CLIENT_VERB`               | Suggested client `.ovpn` `verb` (not server log verb) / `/api/info` | `3` |
+| `MSSFIX`                    | Optional `push "mssfix N"` to clients; exposed on `/api/info` (not duplicated in `.ovpn`) | _(unset)_ |
+| `TUN_DEV`                   | Fixed tun device name (stable ufw/NAT) | _(unset → `dev tun`) |
+| `TUN_IF`                    | Extra FORWARD by iface (optional)   | _(unset)_ |
+| `WAN_IF`                    | WAN iface for MASQUERADE            | `eth0` (auto if missing) |
 | `VPN_SUBNET`, `VPN_NETMASK` | VPN subnet config                  | `10.51.28.0/24`      |
 | `OpenVpnManagement__Port`   | OpenVPN management interface port  | `5092`               |
 | `OpenVpnProxy__ByteDebug`   | Compare proxy vs management bytes (WSS debug) | `false` |
@@ -92,6 +101,80 @@ Environment variables:
 | `PIHOLE_POLL_INTERVAL_SEC`    | Legacy env alias for `PiHole__PollIntervalSeconds`        | _(unset)_ |
 
 **Pi-hole config priority (highest wins):** `PIHOLE_*` / `PiHole__*` env vars → dashboard **Save & apply** (`$DATA_DIR/pihole-runtime-config.json`) → `appsettings` defaults. Env overrides only the fields that are set.
+
+### Multi-stack host (fixed tun + UFW by subnet)
+
+Do **not** rely on `tunN` names in UFW — they change on every OpenVPN recreate. Use:
+
+1. **Image ≥ 1.2.5.94** with `TUN_DEV=ovpn-udp` (unique per stack) — entrypoint writes `dev ovpn-udp` / `dev-type tun`, deletes orphans that still hold this subnet’s `.1`, and installs FORWARD/NAT by **CIDR**.
+2. **Host UFW once per subnet** (survives reboot and tun renames):
+
+```bash
+sudo chmod +x scripts/host-ufw-vpn-subnet.sh
+# UDP pool → internet + DNS via Pi-hole on TCP tun (10.51.30.1):
+sudo ./scripts/host-ufw-vpn-subnet.sh 10.51.32.0/24 10.51.30.1
+```
+
+3. Compose env for UDP WSS:
+
+```yaml
+TUN_DEV: ovpn-udp
+VPN_SUBNET: "10.51.32.0"
+DNS1: "10.51.30.1"
+DNS2: "10.51.30.1"
+DCO: "true"
+CIPHER: "AES-128-GCM"
+```
+
+Keep DNS push on Pi-hole (`10.51.30.1` or this stack’s own `.1`), not public `1.1.1.1`.
+
+#### TCP stack + shared Pi-hole (host netns)
+
+Same host usually has **one Pi-hole** in `network_mode: "container:openvpn-tcp-wss"` (host netns). OpenVPN TCP uses `dev tun` unless `TUN_DEV` is set — after reboot/recreate the kernel picks `tun0`/`tun1`, while UFW still allows `53` on the **old** name. Symptom: dashboard Pi-hole pipeline green (HTTP `:8080`), VPN connected, **no internet** (`block-outside-dns` + DNS timeout). UDP often still works if its iface name is stable (`TUN_DEV=ovpn-udp`) or UFW allows that subnet → Pi-hole `.1`.
+
+**Do this:**
+
+1. Pin TCP: `TUN_DEV: tun-tcp` and `TUN_IF: tun-tcp` (do **not** turn DCO off if it already worked).
+2. Prefer UFW **by destination**, not iface name (survives `tun0` → `tun-tcp`):
+
+```bash
+sudo ufw allow in on tun-tcp proto udp to any port 53 comment 'Pi-hole DNS tun-tcp'
+sudo ufw allow in on tun-tcp proto tcp to any port 53 comment 'Pi-hole DNS tun-tcp'
+# even better, already used on some hosts:
+sudo ufw allow from 10.51.15.0/24 to 10.51.15.1 port 53
+sudo ufw allow from 10.51.16.0/24 to 10.51.16.1 port 53
+```
+
+3. Pi-hole FTL v6: `dns.interface` is **one** name. `BIND` + `tun-tcp,ovpn-udp,br-…` (comma list) or a custom `entrypoint` wrapping `start.sh` can leave `:53` open with **no answers** (`Recv-Q` growing, no `listening on … port 53` in FTL log). Working pattern:
+
+```yaml
+# pi-hole compose — no custom entrypoint
+FTLCONF_dns_listeningMode: 'BIND'
+FTLCONF_dns_interface: 'tun-tcp'   # TCP .1 only
+```
+
+Extra listen IPs (UDP `.1`, docker-bridge for Xray) via `/etc/dnsmasq.d/` **after** FTL is healthy:
+
+```bash
+printf '%s\n' 'listen-address=10.51.16.1' 'listen-address=172.20.0.1' \
+  > ~/pi-hole/etc-dnsmasq.d/99-extra-listen.conf
+docker exec datagate-pihole pihole-FTL --config misc.etc_dnsmasq_d true
+docker restart datagate-pihole
+# log must show: listening on 10.51.16.1 and 172.20.0.1
+```
+
+4. `network_mode: container:openvpn-tcp-wss` stores the **container ID**. Recreate OpenVPN → Pi-hole stays `Exited` (`No such container: <old id>`). Recreate Pi-hole **after** TCP is Up. Optional systemd oneshot (`After=docker.service`) that waits for `openvpn-tcp-wss` + `openvpn-udp-wss` then `docker compose up -d --force-recreate` in `~/pi-hole`.
+5. Host reboot does **not** fix a wedged FTL. Check `docker logs datagate-pihole | grep 'listening on'`. Dashboard step 4 (API `:8080`) ≠ DNS `:53`.
+
+Compose env for TCP WSS:
+
+```yaml
+TUN_DEV: tun-tcp
+TUN_IF: tun-tcp
+VPN_SUBNET: "10.51.15.0"   # example
+DNS1: "10.51.15.1"
+DNS2: "10.51.15.1"
+```
 
 ---
 
@@ -170,6 +253,7 @@ services:
       PORT: "1194"
       API_PORT: 5010
       PROTO: udp
+      # OPENVPN_WSS_UDP_PROXY: rust   # optional: native UDP WSS datapath (default: dotnet)
       OpenVpnManagement__Port: "5092"
       OpenVpnManagement__Host: "localhost"
       BACKEND__BASEURL: "http://backend:5581/"

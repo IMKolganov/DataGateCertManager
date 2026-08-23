@@ -20,6 +20,34 @@ public class ProxyManagementPeerDiagnosticsTests
     }
 
     [Fact]
+    public void NeedsRefreshForClientMapping_True_WhenEmptyOrStale()
+    {
+        Assert.True(ProxyManagementPeerDiagnostics.NeedsRefreshForClientMapping(
+            null,
+            TimeSpan.FromSeconds(60)));
+
+        Assert.True(ProxyManagementPeerDiagnostics.NeedsRefreshForClientMapping(
+            new OpenVpnManagementStatusSnapshot(DateTime.UtcNow, "END", [], true),
+            TimeSpan.FromSeconds(60)));
+
+        Assert.True(ProxyManagementPeerDiagnostics.NeedsRefreshForClientMapping(
+            new OpenVpnManagementStatusSnapshot(
+                DateTime.UtcNow.AddHours(-1),
+                "END",
+                [new OpenVpnManagementClientEntry("cn", "1.1.1.1:1", "10.0.0.2", 0, 0, 0)],
+                true),
+            TimeSpan.FromSeconds(60)));
+
+        Assert.False(ProxyManagementPeerDiagnostics.NeedsRefreshForClientMapping(
+            new OpenVpnManagementStatusSnapshot(
+                DateTime.UtcNow,
+                "END",
+                [new OpenVpnManagementClientEntry("cn", "1.1.1.1:1", "10.0.0.2", 0, 0, 0)],
+                true),
+            TimeSpan.FromSeconds(60)));
+    }
+
+    [Fact]
     public void IsLikelyZombie_ReturnsFalse_WhenCacheOlderThanConnection()
     {
         var snapshot = new OpenVpnManagementStatusSnapshot(

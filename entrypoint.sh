@@ -11,29 +11,91 @@ DNS1=${DNS1:-8.8.8.8}
 DNS2=${DNS2:-8.8.4.4}
 VPN_SUBNET=${VPN_SUBNET:-10.51.28.0}
 VPN_NETMASK=${VPN_NETMASK:-255.255.255.0}
-TUN_IF="${TUN_IF:-tun0}"
+# Fixed tun name (stable across restarts). Empty = classic "dev tun" (kernel picks tunN).
+TUN_DEV="${TUN_DEV:-}"
+# Optional iface for FORWARD (e.g. tcp-wss + Pi-hole on tun0). Prefer subnet rules + TUN_DEV.
+TUN_IF="${TUN_IF:-}"
 WAN_IF="${WAN_IF:-eth0}"
 DCO="${DCO:-false}"
 # Optional push to clients (e.g. 1200 for WSS/UDP tunnels with reduced effective MTU).
 MSSFIX="${MSSFIX:-}"
+# Cipher: override with CIPHER / DATA_CIPHERS. DCO needs AEAD (GCM/ChaCha), not CBC.
+CIPHER="${CIPHER:-}"
+DATA_CIPHERS="${DATA_CIPHERS:-}"
+AUTH="${AUTH:-SHA256}"
+TLS_VERSION_MIN="${TLS_VERSION_MIN:-1.2}"
+# Client .ovpn verb (server log verb stays separate).
+CLIENT_VERB="${CLIENT_VERB:-3}"
+export AUTH TLS_VERSION_MIN CLIENT_VERB
+# UDP WebSocket datapath: "dotnet" (default) or "rust" (native proxy behind local nginx front).
+OPENVPN_WSS_UDP_PROXY="${OPENVPN_WSS_UDP_PROXY:-dotnet}"
+INTERNAL_DOTNET_PORT="${INTERNAL_DOTNET_PORT:-18080}"
+INTERNAL_RUST_PORT="${INTERNAL_RUST_PORT:-18081}"
 
 EASYRSA_DIR="$DATA_DIR/easy-rsa"
 SCRIPT_SOURCE="/scripts"
 
-# .NET port
-if [ -n "$API_PORT" ]; then
+# .NET listen port — public API_PORT, or loopback when rust front owns API_PORT.
+if [ "${OPENVPN_WSS_UDP_PROXY}" = "rust" ]; then
+  unset ASPNETCORE_HTTP_PORTS || true
+  unset ASPNETCORE_URLS || true
+  export OPENVPN_WSS_UDP_PROXY=rust
+  export INTERNAL_DOTNET_PORT
+  echo "[entrypoint] OPENVPN_WSS_UDP_PROXY=rust → .NET on 127.0.0.1:${INTERNAL_DOTNET_PORT}, Rust on 127.0.0.1:${INTERNAL_RUST_PORT}, nginx on ${API_PORT}"
+elif [ -n "$API_PORT" ]; then
   export ASPNETCORE_HTTP_PORTS="$API_PORT"
-  echo "[entrypoint] Set ASPNETCORE_HTTP_PORTS to $ASPNETCORE_HTTP_PORTS"
+  echo "[entrypoint] Set ASPNETCORE_HTTP_PORTS to $ASPNETCORE_HTTP_PORTS (OPENVPN_WSS_UDP_PROXY=${OPENVPN_WSS_UDP_PROXY})"
 fi
 
 echo "===== STARTING OPENVPN CONTAINER ====="
 
-# NAT/forward
+# Prefer default route device when WAN_IF left at eth0 but host uses another NIC.
+if [ "$WAN_IF" = "eth0" ] && ! ip -br link show eth0 >/dev/null 2>&1; then
+  WAN_IF=$(ip route get 1.1.1.1 2>/dev/null | awk '{for(i=1;i<=NF;i++) if($i=="dev"){print $(i+1); exit}}')
+  WAN_IF="${WAN_IF:-eth0}"
+fi
+
+# iptables prefers CIDR; map common dotted masks.
+case "$VPN_NETMASK" in
+  255.255.255.0) VPN_PREFIX=24 ;;
+  255.255.0.0)   VPN_PREFIX=16 ;;
+  255.0.0.0)     VPN_PREFIX=8 ;;
+  *)             VPN_PREFIX=24 ;;
+esac
+VPN_CIDR="$VPN_SUBNET/$VPN_PREFIX"
+# Server address on tun (.1 for typical /24 pool).
+VPN_SERVER_IP="${VPN_SUBNET%.*}.1"
+
+echo "[entrypoint] WAN_IF=$WAN_IF VPN_CIDR=$VPN_CIDR TUN_DEV=${TUN_DEV:-<auto>} TUN_IF=${TUN_IF:-<none>}"
+
+# NAT + forward by subnet (stable; do not depend on tun0/tun4 name churn).
 iptables -P FORWARD ACCEPT
-iptables -C FORWARD -i "$TUN_IF" -j ACCEPT 2>/dev/null || iptables -A FORWARD -i "$TUN_IF" -j ACCEPT
-iptables -C FORWARD -o "$TUN_IF" -j ACCEPT 2>/dev/null || iptables -A FORWARD -o "$TUN_IF" -j ACCEPT
-iptables -t nat -C POSTROUTING -s "$VPN_SUBNET/$VPN_NETMASK" -o "$WAN_IF" -j MASQUERADE 2>/dev/null \
-  || iptables -t nat -A POSTROUTING -s "$VPN_SUBNET/$VPN_NETMASK" -o "$WAN_IF" -j MASQUERADE
+iptables -C FORWARD -s "$VPN_CIDR" -j ACCEPT 2>/dev/null \
+  || iptables -I FORWARD 1 -s "$VPN_CIDR" -j ACCEPT
+iptables -C FORWARD -d "$VPN_CIDR" -j ACCEPT 2>/dev/null \
+  || iptables -I FORWARD 1 -d "$VPN_CIDR" -j ACCEPT
+# Optional iface rules (tcp-wss + pi-hole on a known tun).
+if [ -n "$TUN_IF" ]; then
+  iptables -C FORWARD -i "$TUN_IF" -j ACCEPT 2>/dev/null || iptables -A FORWARD -i "$TUN_IF" -j ACCEPT
+  iptables -C FORWARD -o "$TUN_IF" -j ACCEPT 2>/dev/null || iptables -A FORWARD -o "$TUN_IF" -j ACCEPT
+fi
+iptables -t nat -C POSTROUTING -s "$VPN_CIDR" -o "$WAN_IF" -j MASQUERADE 2>/dev/null \
+  || iptables -t nat -A POSTROUTING -s "$VPN_CIDR" -o "$WAN_IF" -j MASQUERADE
+
+# Drop orphan ifaces that still hold this stack's .1 (leftover from `dev tun` restarts).
+KEEP_IF="${TUN_DEV:-$TUN_IF}"
+ip -o -4 addr show 2>/dev/null | awk -v ip="$VPN_SERVER_IP/" '$0 ~ ip {print $2}' | while read -r iface; do
+  [ -z "$iface" ] && continue
+  [ -n "$KEEP_IF" ] && [ "$iface" = "$KEEP_IF" ] && continue
+  echo "[entrypoint] Removing orphan $iface (had $VPN_SERVER_IP)"
+  ip link delete "$iface" 2>/dev/null || true
+done
+
+# Drop stale fixed-name device so OpenVPN can recreate it cleanly.
+if [ -n "$TUN_DEV" ] && ip link show "$TUN_DEV" >/dev/null 2>&1; then
+  echo "[entrypoint] Removing stale $TUN_DEV before OpenVPN start"
+  ip link delete "$TUN_DEV" 2>/dev/null || true
+fi
 
 echo "===== Copying OpenVPN hook scripts ====="
 mkdir -p /etc/openvpn/scripts
@@ -110,20 +172,44 @@ done
 # Generate default server.conf if not present
 echo "Generating server.conf from environment..."
 # DCO=false (default) -> disable-dco in config; DCO=true -> DCO enabled, no disable-dco
+# DCO data-path needs AEAD (GCM/ChaCha); CBC stays in userspace and caps throughput.
 if [ "$DCO" = "true" ] || [ "$DCO" = "1" ] || [ "$DCO" = "yes" ]; then
   DCO_OPTION=""
+  CIPHER="${CIPHER:-AES-128-GCM}"
+  DATA_CIPHERS="${DATA_CIPHERS:-AES-128-GCM:AES-256-GCM:CHACHA20-POLY1305}"
 else
   DCO_OPTION="disable-dco"
+  CIPHER="${CIPHER:-AES-256-CBC}"
+  # leave DATA_CIPHERS empty unless explicitly set
 fi
+
+if [ -n "$DATA_CIPHERS" ]; then
+  CIPHER_LINES="data-ciphers $DATA_CIPHERS
+cipher $CIPHER"
+else
+  CIPHER_LINES="cipher $CIPHER"
+fi
+echo "[entrypoint] DCO=${DCO:-false} cipher=$CIPHER data-ciphers=${DATA_CIPHERS:-<none>} auth=$AUTH tls-version-min=$TLS_VERSION_MIN"
+# Make resolved crypto visible to DataGateOpenVpnManager (/api/info + .ovpn issue).
+export CIPHER DATA_CIPHERS DCO
+
 MSSFIX_LINE=""
 if [ -n "$MSSFIX" ]; then
   MSSFIX_LINE="push \"mssfix $MSSFIX\""
   echo "[entrypoint] MSSFIX push enabled: $MSSFIX"
 fi
+
+if [ -n "$TUN_DEV" ]; then
+  DEV_LINES="dev $TUN_DEV
+dev-type tun"
+else
+  DEV_LINES="dev tun"
+fi
+
 cat <<EOF > "$DATA_DIR/server.conf"
 port $PORT
 proto $PROTO
-dev tun
+$DEV_LINES
 $DCO_OPTION
 
 ca /etc/openvpn/ca.crt
@@ -145,11 +231,11 @@ ${MSSFIX_LINE}
 keepalive 15 120
 
 remote-cert-tls client
-tls-version-min 1.2
+tls-version-min $TLS_VERSION_MIN
 tls-crypt /etc/openvpn/ta.key
 
-cipher AES-256-CBC
-auth SHA256
+$CIPHER_LINES
+auth $AUTH
 
 user nobody
 group nogroup
@@ -230,8 +316,9 @@ echo "===== server.conf contents ====="
 cat "$DATA_DIR/server.conf" || echo "server.conf not found!"
 
 echo "===== Starting OpenVPN in background..."
-openvpn --config "$DATA_DIR/server.conf" &
+openvpn --config "$DATA_DIR/server.conf" --writepid "$DATA_DIR/openvpn.pid" &
 OPENVPN_PID=$!
+echo "[entrypoint] OpenVPN pid=$OPENVPN_PID (also in $DATA_DIR/openvpn.pid)"
 
 # 👇 Stream OpenVPN logs to Docker stdout (suppress raw tls-crypt probe noise; enrichment service re-logs with origin tags)
 echo "===== Attaching OpenVPN log to stdout... ====="
@@ -264,25 +351,152 @@ runuser -u nobody -- cat "$EASYRSA_DIR/pki/crl.pem" >/dev/null \
 echo "✅ Found required .NET files"
 cd /app
 
+write_rust_front_nginx_conf() {
+  cat > /tmp/wss-udp-front.conf <<EOF
+daemon off;
+worker_processes auto;
+error_log /dev/stderr warn;
+pid /tmp/nginx-wss-front.pid;
+
+events {
+    worker_connections 4096;
+}
+
+http {
+    access_log off;
+    client_max_body_size 0;
+
+    map \$http_upgrade \$connection_upgrade {
+        default upgrade;
+        ''      close;
+    }
+
+    map \$arg_mode \$ovpn_proxy_upstream {
+        default http://127.0.0.1:${INTERNAL_DOTNET_PORT};
+        udp     http://127.0.0.1:${INTERNAL_RUST_PORT};
+    }
+
+    server {
+        listen ${API_PORT};
+        server_name _;
+
+        location = /healthz {
+            proxy_pass http://127.0.0.1:${INTERNAL_RUST_PORT}/healthz;
+        }
+
+        location = /version {
+            proxy_pass http://127.0.0.1:${INTERNAL_RUST_PORT}/version;
+        }
+
+        location /api/proxy {
+            proxy_pass \$ovpn_proxy_upstream;
+            proxy_http_version 1.1;
+            proxy_set_header Upgrade \$http_upgrade;
+            proxy_set_header Connection \$connection_upgrade;
+            proxy_set_header Host \$host;
+            proxy_set_header X-Real-IP \$remote_addr;
+            proxy_set_header X-Forwarded-For \$proxy_add_x_forwarded_for;
+            proxy_set_header X-Forwarded-Proto \$scheme;
+            proxy_set_header Authorization \$http_authorization;
+            proxy_read_timeout 86400s;
+            proxy_send_timeout 86400s;
+            proxy_buffering off;
+            proxy_request_buffering off;
+            proxy_socket_keepalive on;
+            tcp_nodelay on;
+        }
+
+        location / {
+            proxy_pass http://127.0.0.1:${INTERNAL_DOTNET_PORT};
+            proxy_http_version 1.1;
+            proxy_set_header Upgrade \$http_upgrade;
+            proxy_set_header Connection \$connection_upgrade;
+            proxy_set_header Host \$host;
+            proxy_set_header X-Real-IP \$remote_addr;
+            proxy_set_header X-Forwarded-For \$proxy_add_x_forwarded_for;
+            proxy_set_header X-Forwarded-Proto \$scheme;
+            proxy_set_header Authorization \$http_authorization;
+            proxy_read_timeout 86400s;
+            proxy_send_timeout 86400s;
+            proxy_buffering off;
+        }
+    }
+}
+EOF
+}
+
+RUST_PID=""
+NGINX_FRONT_PID=""
+
+if [ "${OPENVPN_WSS_UDP_PROXY}" = "rust" ]; then
+  if [ ! -x /usr/local/bin/wss-udp-proxy ]; then
+    echo "❌ OPENVPN_WSS_UDP_PROXY=rust but /usr/local/bin/wss-udp-proxy is missing"
+    exit 1
+  fi
+
+  echo "[entrypoint] Starting Rust WSS↔UDP proxy on 127.0.0.1:${INTERNAL_RUST_PORT} → ${PORT}/udp"
+  LISTEN="127.0.0.1:${INTERNAL_RUST_PORT}" \
+    VPN_HOST="127.0.0.1" \
+    PORT="${PORT}" \
+    RUST_LOG="${RUST_LOG:-wss_udp_proxy=info}" \
+    /usr/local/bin/wss-udp-proxy &
+  RUST_PID=$!
+
+  # Wait briefly so /version is queryable for ops checks.
+  for _ in 1 2 3 4 5 6 7 8 9 10; do
+    if curl -sf "http://127.0.0.1:${INTERNAL_RUST_PORT}/version" >/tmp/wss-udp-proxy.version 2>/dev/null; then
+      echo "[entrypoint] Rust proxy version: $(tr -d '\n' </tmp/wss-udp-proxy.version)"
+      break
+    fi
+    sleep 0.2
+  done
+
+  write_rust_front_nginx_conf
+  echo "[entrypoint] Starting nginx front on :${API_PORT}"
+  nginx -c /tmp/wss-udp-front.conf &
+  NGINX_FRONT_PID=$!
+fi
+
 dotnet DataGateOpenVpnManager.dll &
 DOTNET_PID=$!
 
-# Wait for OpenVPN and .NET
-wait $OPENVPN_PID
-OPENVPN_EXIT_CODE=$?
+if [ "${OPENVPN_WSS_UDP_PROXY}" = "rust" ]; then
+  sleep 1
+  echo "[entrypoint] public /version → $(curl -sf "http://127.0.0.1:${API_PORT}/version" 2>/dev/null || echo 'unavailable')"
+fi
 
+# Keep container alive on the .NET manager. OpenVPN may be killed/restarted via
+# POST /api/openvpn/{start|restart|kill} without exiting the container.
 wait $DOTNET_PID
 DOTNET_EXIT_CODE=$?
 
+if [ -n "$NGINX_FRONT_PID" ] && kill -0 "$NGINX_FRONT_PID" 2>/dev/null; then
+  echo "[entrypoint] Stopping nginx front pid=$NGINX_FRONT_PID"
+  kill "$NGINX_FRONT_PID" 2>/dev/null || true
+fi
+if [ -n "$RUST_PID" ] && kill -0 "$RUST_PID" 2>/dev/null; then
+  echo "[entrypoint] Stopping Rust proxy pid=$RUST_PID"
+  kill "$RUST_PID" 2>/dev/null || true
+fi
+
+# Stop OpenVPN (current pid file or original entrypoint pid) when manager exits.
+if [ -f "$DATA_DIR/openvpn.pid" ]; then
+  OPENVPN_CURRENT_PID="$(tr -d '[:space:]' < "$DATA_DIR/openvpn.pid" || true)"
+  if [ -n "$OPENVPN_CURRENT_PID" ] && kill -0 "$OPENVPN_CURRENT_PID" 2>/dev/null; then
+    echo "[entrypoint] Stopping OpenVPN pid=$OPENVPN_CURRENT_PID after manager exit"
+    kill "$OPENVPN_CURRENT_PID" 2>/dev/null || true
+  fi
+elif kill -0 "$OPENVPN_PID" 2>/dev/null; then
+  echo "[entrypoint] Stopping original OpenVPN pid=$OPENVPN_PID after manager exit"
+  kill "$OPENVPN_PID" 2>/dev/null || true
+fi
+
 # Kill tail (optional, for clean shutdown)
 kill $TAIL_PID 2>/dev/null || true
-
-if [ $OPENVPN_EXIT_CODE -ne 0 ]; then
-  echo "OpenVPN exited with code $OPENVPN_EXIT_CODE"
-  exit $OPENVPN_EXIT_CODE
-fi
 
 if [ $DOTNET_EXIT_CODE -ne 0 ]; then
   echo ".NET app exited with code $DOTNET_EXIT_CODE"
   exit $DOTNET_EXIT_CODE
 fi
+
+exit 0

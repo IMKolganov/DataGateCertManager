@@ -136,9 +136,32 @@ public class ExternalIpAddressServiceTests
     [InlineData("127.0.0.1")]
     [InlineData("0.0.0.0")]
     [InlineData("not-an-ip")]
+    [InlineData("2a04:3540:1000:310:549d:1fff:fe9e:7afb")]
+    [InlineData("::1")]
     public void TryParsePublicIp_RejectsInvalid(string raw)
     {
         Assert.False(ExternalIpAddressService.TryParsePublicIp(raw, out _));
+    }
+
+    [Fact]
+    public async Task GetPublicIpAddressAsync_SkipsIpv6AndUsesNextProvider()
+    {
+        const string url1 = "https://a.test/ip";
+        const string url2 = "https://b.test/ip";
+        var handler = new FakeHandler((req, _) =>
+        {
+            var body = req.RequestUri!.ToString() == url1
+                ? "2a04:3540:1000:310:549d:1fff:fe9e:7afb"
+                : "212.147.237.141";
+            return Task.FromResult(new HttpResponseMessage(HttpStatusCode.OK)
+            {
+                Content = new StringContent(body)
+            });
+        });
+        var sut = new ExternalIpAddressService(
+            _logger.Object, BuildConfig(url1, url2), new HttpClient(handler), new MemoryCache(new MemoryCacheOptions()));
+
+        Assert.Equal("212.147.237.141", await sut.GetPublicIpAddressAsync(CancellationToken.None));
     }
 
     [Fact]

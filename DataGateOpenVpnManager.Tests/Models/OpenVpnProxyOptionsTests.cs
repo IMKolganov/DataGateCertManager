@@ -13,14 +13,17 @@ public class OpenVpnProxyOptionsTests
     }
 
     [Theory]
-    [InlineData(true, 10, true)]
-    [InlineData(false, 10, true)]
-    [InlineData(true, 0, false)]
-    [InlineData(false, 0, false)]
-    public void NeedsBackgroundManagementRefresh_ReflectsZombieAndPeriodicByteDebug(
+    [InlineData(true, 10, true, false, true)]
+    [InlineData(false, 10, true, false, true)]
+    [InlineData(true, 0, false, false, false)]
+    [InlineData(false, 0, false, false, false)]
+    [InlineData(false, 0, false, true, true)]
+    public void NeedsBackgroundManagementRefresh_ReflectsZombieByteDebugAndPiHole(
         bool byteDebug,
         int byteDebugInterval,
-        bool zombieEnabled)
+        bool zombieEnabled,
+        bool piHoleEnabled,
+        bool expected)
     {
         var options = new OpenVpnProxyOptions
         {
@@ -29,6 +32,6 @@ public class OpenVpnProxyOptionsTests
             CloseZombieAfterMissingSeconds = zombieEnabled ? 60 : 0
         };
 
-        Assert.Equal(zombieEnabled || byteDebug && byteDebugInterval > 0, options.NeedsBackgroundManagementRefresh);
+        Assert.Equal(expected, options.NeedsBackgroundManagementRefresh(piHoleEnabled));
     }
 }

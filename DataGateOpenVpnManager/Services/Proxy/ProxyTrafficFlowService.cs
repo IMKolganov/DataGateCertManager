@@ -33,44 +33,41 @@ public sealed class ProxyTrafficFlowService : IProxyTrafficFlowService
         _connections[connection.ConnectionId] = state;
     }
 
+    public IProxyFlowCounter? GetCounter(string connectionId) =>
+        _connections.TryGetValue(connectionId, out var state) ? state : null;
+
     public ProxyTrafficFlowUpdate? UnregisterConnection(string connectionId, DateTime? disconnectedAtUtc = null)
     {
         if (!_connections.TryRemove(connectionId, out var state))
             return null;
 
         var emittedAt = disconnectedAtUtc ?? DateTime.UtcNow;
-        ProxyTrafficFlowUpdate terminal;
-        lock (state.SyncRoot)
+        var (c2sTotal, s2cTotal, c2sDelta, s2cDelta, lastActivity) = state.SnapshotAndClearDeltas();
+        var terminal = new ProxyTrafficFlowUpdate
         {
-            terminal = new ProxyTrafficFlowUpdate
-            {
-                ConnectionId = state.ConnectionId,
-                Protocol = state.Protocol,
-                State = "disconnected",
-                IsConnected = false,
-                IsIdle = true,
-                RealClientIp = state.RealClientIp,
-                RealClientPort = state.RealClientPort,
-                ClientRef = state.ClientRef,
-                UserId = state.UserId,
-                Username = state.Username,
-                Email = state.Email,
-                LocalProxyIp = state.LocalProxyIp,
-                LocalProxyPort = state.LocalProxyPort,
-                TargetIp = state.TargetIp,
-                TargetPort = state.TargetPort,
-                ClientToServerBytesTotal = state.ClientToServerBytesTotal,
-                ServerToClientBytesTotal = state.ServerToClientBytesTotal,
-                ClientToServerBytesDelta = state.ClientToServerBytesDelta,
-                ServerToClientBytesDelta = state.ServerToClientBytesDelta,
-                ConnectedAtUtc = state.ConnectedAtUtc,
-                LastActivityAtUtc = state.LastActivityAtUtc,
-                EmittedAtUtc = emittedAt
-            };
-
-            state.ClientToServerBytesDelta = 0;
-            state.ServerToClientBytesDelta = 0;
-        }
+            ConnectionId = state.ConnectionId,
+            Protocol = state.Protocol,
+            State = "disconnected",
+            IsConnected = false,
+            IsIdle = true,
+            RealClientIp = state.RealClientIp,
+            RealClientPort = state.RealClientPort,
+            ClientRef = state.ClientRef,
+            UserId = state.UserId,
+            Username = state.Username,
+            Email = state.Email,
+            LocalProxyIp = state.LocalProxyIp,
+            LocalProxyPort = state.LocalProxyPort,
+            TargetIp = state.TargetIp,
+            TargetPort = state.TargetPort,
+            ClientToServerBytesTotal = c2sTotal,
+            ServerToClientBytesTotal = s2cTotal,
+            ClientToServerBytesDelta = c2sDelta,
+            ServerToClientBytesDelta = s2cDelta,
+            ConnectedAtUtc = state.ConnectedAtUtc,
+            LastActivityAtUtc = lastActivity,
+            EmittedAtUtc = emittedAt
+        };
 
         _terminalUpdates.Enqueue(terminal);
         return terminal;
@@ -83,12 +80,8 @@ public sealed class ProxyTrafficFlowService : IProxyTrafficFlowService
         if (!_connections.TryGetValue(connectionId, out var state))
             return false;
 
-        lock (state.SyncRoot)
-        {
-            clientToServerBytesTotal = state.ClientToServerBytesTotal;
-            serverToClientBytesTotal = state.ServerToClientBytesTotal;
-        }
-
+        clientToServerBytesTotal = state.ClientToServerBytesTotal;
+        serverToClientBytesTotal = state.ServerToClientBytesTotal;
         return true;
     }
 
@@ -143,22 +136,7 @@ public sealed class ProxyTrafficFlowService : IProxyTrafficFlowService
         if (!_connections.TryGetValue(connectionId, out var state))
             return;
 
-        var at = occurredAtUtc ?? DateTime.UtcNow;
-        lock (state.SyncRoot)
-        {
-            if (direction == ProxyTrafficFlowDirection.ClientToServer)
-            {
-                state.ClientToServerBytesTotal += bytes;
-                state.ClientToServerBytesDelta += bytes;
-            }
-            else
-            {
-                state.ServerToClientBytesTotal += bytes;
-                state.ServerToClientBytesDelta += bytes;
-            }
-
-            state.LastActivityAtUtc = at;
-        }
+        state.Add(direction, bytes, occurredAtUtc);
     }
 
     public IReadOnlyCollection<ProxyTrafficFlowUpdate> BuildBatch(DateTime emittedAtUtc)
@@ -166,44 +144,37 @@ public sealed class ProxyTrafficFlowService : IProxyTrafficFlowService
         var result = new List<ProxyTrafficFlowUpdate>(_connections.Count + _terminalUpdates.Count);
         foreach (var state in _connections.Values)
         {
-            lock (state.SyncRoot)
+            var (c2sTotal, s2cTotal, c2sDelta, s2cDelta, lastActivity) = state.SnapshotAndClearDeltas();
+            var isIdle = emittedAtUtc - lastActivity >= IdleThreshold;
+            result.Add(new ProxyTrafficFlowUpdate
             {
-                var isIdle = emittedAtUtc - state.LastActivityAtUtc >= IdleThreshold;
-                result.Add(new ProxyTrafficFlowUpdate
-                {
-                    ConnectionId = state.ConnectionId,
-                    Protocol = state.Protocol,
-                    State = "connected",
-                    IsConnected = true,
-                    IsIdle = isIdle,
-                    RealClientIp = state.RealClientIp,
-                    RealClientPort = state.RealClientPort,
-                    ClientRef = state.ClientRef,
-                    UserId = state.UserId,
-                    Username = state.Username,
-                    Email = state.Email,
-                    LocalProxyIp = state.LocalProxyIp,
-                    LocalProxyPort = state.LocalProxyPort,
-                    TargetIp = state.TargetIp,
-                    TargetPort = state.TargetPort,
-                    ClientToServerBytesTotal = state.ClientToServerBytesTotal,
-                    ServerToClientBytesTotal = state.ServerToClientBytesTotal,
-                    ClientToServerBytesDelta = state.ClientToServerBytesDelta,
-                    ServerToClientBytesDelta = state.ServerToClientBytesDelta,
-                    ConnectedAtUtc = state.ConnectedAtUtc,
-                    LastActivityAtUtc = state.LastActivityAtUtc,
-                    EmittedAtUtc = emittedAtUtc
-                });
-
-                state.ClientToServerBytesDelta = 0;
-                state.ServerToClientBytesDelta = 0;
-            }
+                ConnectionId = state.ConnectionId,
+                Protocol = state.Protocol,
+                State = "connected",
+                IsConnected = true,
+                IsIdle = isIdle,
+                RealClientIp = state.RealClientIp,
+                RealClientPort = state.RealClientPort,
+                ClientRef = state.ClientRef,
+                UserId = state.UserId,
+                Username = state.Username,
+                Email = state.Email,
+                LocalProxyIp = state.LocalProxyIp,
+                LocalProxyPort = state.LocalProxyPort,
+                TargetIp = state.TargetIp,
+                TargetPort = state.TargetPort,
+                ClientToServerBytesTotal = c2sTotal,
+                ServerToClientBytesTotal = s2cTotal,
+                ClientToServerBytesDelta = c2sDelta,
+                ServerToClientBytesDelta = s2cDelta,
+                ConnectedAtUtc = state.ConnectedAtUtc,
+                LastActivityAtUtc = lastActivity,
+                EmittedAtUtc = emittedAtUtc
+            });
         }
 
         while (_terminalUpdates.TryDequeue(out var terminal))
-        {
             result.Add(terminal);
-        }
 
         return result;
     }
@@ -245,8 +216,14 @@ public sealed class ProxyTrafficFlowService : IProxyTrafficFlowService
         string.Equals(ActiveProxyConnectionService.NormalizeHost(localProxyIp), needleNormalized,
             StringComparison.OrdinalIgnoreCase);
 
-    private sealed class FlowConnectionState
+    private sealed class FlowConnectionState : IProxyFlowCounter
     {
+        private long _c2sTotal;
+        private long _s2cTotal;
+        private long _c2sDelta;
+        private long _s2cDelta;
+        private long _lastActivityUtcTicks;
+
         public FlowConnectionState(
             string connectionId,
             ProxyConnectionProtocol protocol,
@@ -277,10 +254,9 @@ public sealed class ProxyTrafficFlowService : IProxyTrafficFlowService
             TargetIp = targetIp;
             TargetPort = targetPort;
             ConnectedAtUtc = connectedAtUtc;
-            LastActivityAtUtc = connectedAtUtc;
+            _lastActivityUtcTicks = connectedAtUtc.Ticks;
         }
 
-        public object SyncRoot { get; } = new();
         public string ConnectionId { get; }
         public ProxyConnectionProtocol Protocol { get; }
         public string? RealClientIp { get; }
@@ -295,10 +271,48 @@ public sealed class ProxyTrafficFlowService : IProxyTrafficFlowService
         public string? TargetIp { get; }
         public int TargetPort { get; }
         public DateTime ConnectedAtUtc { get; }
-        public DateTime LastActivityAtUtc { get; set; }
-        public long ClientToServerBytesTotal { get; set; }
-        public long ServerToClientBytesTotal { get; set; }
-        public long ClientToServerBytesDelta { get; set; }
-        public long ServerToClientBytesDelta { get; set; }
+
+        public long ClientToServerBytesTotal => Interlocked.Read(ref _c2sTotal);
+        public long ServerToClientBytesTotal => Interlocked.Read(ref _s2cTotal);
+
+        public void Add(ProxyTrafficFlowDirection direction, long bytes) =>
+            Add(direction, bytes, occurredAtUtc: null);
+
+        public void Add(ProxyTrafficFlowDirection direction, long bytes, DateTime? occurredAtUtc)
+        {
+            if (bytes <= 0)
+                return;
+
+            if (direction == ProxyTrafficFlowDirection.ClientToServer)
+            {
+                Interlocked.Add(ref _c2sTotal, bytes);
+                Interlocked.Add(ref _c2sDelta, bytes);
+            }
+            else
+            {
+                Interlocked.Add(ref _s2cTotal, bytes);
+                Interlocked.Add(ref _s2cDelta, bytes);
+            }
+
+            var ticks = (occurredAtUtc ?? DateTime.UtcNow).Ticks;
+            // Keep the newest activity timestamp without a lock.
+            long current;
+            do
+            {
+                current = Volatile.Read(ref _lastActivityUtcTicks);
+                if (ticks <= current)
+                    break;
+            } while (Interlocked.CompareExchange(ref _lastActivityUtcTicks, ticks, current) != current);
+        }
+
+        public (long C2sTotal, long S2cTotal, long C2sDelta, long S2cDelta, DateTime LastActivity) SnapshotAndClearDeltas()
+        {
+            var c2sTotal = Interlocked.Read(ref _c2sTotal);
+            var s2cTotal = Interlocked.Read(ref _s2cTotal);
+            var c2sDelta = Interlocked.Exchange(ref _c2sDelta, 0);
+            var s2cDelta = Interlocked.Exchange(ref _s2cDelta, 0);
+            var last = new DateTime(Volatile.Read(ref _lastActivityUtcTicks), DateTimeKind.Utc);
+            return (c2sTotal, s2cTotal, c2sDelta, s2cDelta, last);
+        }
     }
 }

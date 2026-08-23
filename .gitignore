@@ -429,3 +429,6 @@ dashboardapi.json
 *.key
 *.cnf
 data
+
+# Rust WSS UDP proxy build artifacts
+wss-udp-proxy-rs/target/

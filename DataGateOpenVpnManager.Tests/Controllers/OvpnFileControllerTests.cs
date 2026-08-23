@@ -82,7 +82,8 @@ public class OvpnFileControllerTests
     {
         var request = new DownloadOvpnFileRequest { FileName = "client1.ovpn", FilePath = "/path/client1.ovpn" };
         var download = new OvpnFileDownload { FileName = "client1.ovpn", Content = new byte[] { 1, 2, 3 } };
-        _ovpnFileServiceMock.Setup(s => s.GetOvpnFile(It.IsAny<string>(), It.IsAny<string>(), It.IsAny<CancellationToken>()))
+        _ovpnFileServiceMock.Setup(s => s.GetOvpnFile(
+                It.IsAny<string>(), It.IsAny<string>(), It.IsAny<string?>(), It.IsAny<CancellationToken>()))
             .ReturnsAsync(download);
 
         var controller = new OvpnFileController(_ovpnFileServiceMock.Object, _pathResolverMock.Object, _loggerMock.Object);

@@ -1,6 +1,6 @@
 {
   "ExternalIpServices": [
-    "https://api64.ipify.org",
+    "https://api.ipify.org",
     "https://checkip.amazonaws.com",
     "https://ifconfig.me/ip",
     "https://icanhazip.com"

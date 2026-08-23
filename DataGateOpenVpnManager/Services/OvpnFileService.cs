@@ -1,4 +1,5 @@
-﻿using DataGateOpenVpnManager.Models;
+﻿using DataGateOpenVpnManager.Helpers;
+using DataGateOpenVpnManager.Models;
 using DataGateOpenVpnManager.Services.EasyRsaServices.Interfaces;
 using DataGateOpenVpnManager.Services.Interfaces;
 using DataGateMonitor.SharedModels.DataGateOpenVpnManager.OvpnFile.Responses;
@@ -9,7 +10,9 @@ namespace DataGateOpenVpnManager.Services;
 public class OvpnFileService(
     ILogger<IOvpnFileService> logger,
     IEasyRsaService easyRsaService,
-    IOptions<EasyRsaOptions> options)
+    IOptions<EasyRsaOptions> options,
+    IOvpnIssuanceTracker issuanceTracker,
+    IConfiguration configuration)
     : IOvpnFileService
 {
     public async Task<OvpnFileMetadata> AddOvpnFile(string easyRsaPath, string commonName, string friendlyΝame,
@@ -18,62 +21,71 @@ public class OvpnFileService(
         string issuedTo = "openVpnClient", int certExpireDays = 365)
     {
         easyRsaPath = Path.GetFullPath(easyRsaPath);
-        
-        var ovpnFileDir = Path.Combine(easyRsaPath, "pki", "ovpn_files");
-        logger.LogInformation("Step 1: Building client certificate...");
-        var certResult = await easyRsaService.BuildCertificateAsync(easyRsaPath, 
-            cancellationToken, commonName, certExpireDays);
-
-        var caCertPath = Path.Combine(easyRsaPath, "pki", "ca.crt");
-        var caCertContent = await ReadPemContentAsync(
-                caCertPath ?? throw new InvalidOperationException("CaCertPath is null."),
-                cancellationToken);
-        var clientCertContent = await ReadPemContentAsync(
-            certResult.CertificatePath ?? throw new InvalidOperationException("CertificatePath is null."), 
-            cancellationToken);
-        var clientKeyContent =
-            await File.ReadAllTextAsync(certResult.KeyPath ?? throw new InvalidOperationException("KeyPath is null."),
-                cancellationToken);
-        var taKeyPath = Path.Combine(easyRsaPath, "pki", options.Value.TaKeyFileName);
-        var taKeyContent =
-            await  File.ReadAllTextAsync(taKeyPath ?? throw new InvalidOperationException("TaCertPath is null."),
-                cancellationToken);
-        
-        logger.LogInformation("Step 3: Generating .ovpn file...");//todo:null or empty configTemplate
-        var ovpnContent = GenerateOvpnFile(configTemplate, friendlyΝame,serverIp, serverPort, caCertContent, 
-            clientCertContent, clientKeyContent, taKeyContent);
-
-        logger.LogInformation("Step 4: Writing .ovpn file...");
-
-        var targetDir = ovpnFileDir ?? throw new InvalidOperationException("OvpnFileDir is null.");
-        if (!Directory.Exists(targetDir))
+        await using var issuance = issuanceTracker.Begin(commonName);
+        try
         {
-            Directory.CreateDirectory(targetDir);
+            var ovpnFileDir = Path.Combine(easyRsaPath, "pki", "ovpn_files");
+            logger.LogInformation("Step 1: Building client certificate...");
+            var certResult = await easyRsaService.BuildCertificateAsync(easyRsaPath, 
+                cancellationToken, commonName, certExpireDays);
+
+            var caCertPath = Path.Combine(easyRsaPath, "pki", "ca.crt");
+            var caCertContent = await ReadPemContentAsync(
+                    caCertPath ?? throw new InvalidOperationException("CaCertPath is null."),
+                    cancellationToken);
+            var clientCertContent = await ReadPemContentAsync(
+                certResult.CertificatePath ?? throw new InvalidOperationException("CertificatePath is null."), 
+                cancellationToken);
+            var clientKeyContent =
+                await File.ReadAllTextAsync(certResult.KeyPath ?? throw new InvalidOperationException("KeyPath is null."),
+                    cancellationToken);
+            var taKeyPath = Path.Combine(easyRsaPath, "pki", options.Value.TaKeyFileName);
+            var taKeyContent =
+                await  File.ReadAllTextAsync(taKeyPath ?? throw new InvalidOperationException("TaCertPath is null."),
+                    cancellationToken);
+            
+            logger.LogInformation("Step 3: Generating .ovpn file...");//todo:null or empty configTemplate
+            var ovpnContent = GenerateOvpnFile(configTemplate, friendlyΝame,serverIp, serverPort, caCertContent, 
+                clientCertContent, clientKeyContent, taKeyContent);
+
+            logger.LogInformation("Step 4: Writing .ovpn file...");
+
+            var targetDir = ovpnFileDir ?? throw new InvalidOperationException("OvpnFileDir is null.");
+            if (!Directory.Exists(targetDir))
+            {
+                Directory.CreateDirectory(targetDir);
+            }
+
+            var ovpnFilePath = Path.Combine(targetDir, $"{commonName}.ovpn");
+            await File.WriteAllTextAsync(ovpnFilePath, ovpnContent, cancellationToken);
+
+            logger.LogInformation("Client configuration file created: {Path}", ovpnFilePath);
+
+            var fileInfo = new FileInfo(Path.GetFullPath(ovpnFilePath));
+            if (!fileInfo.Exists)
+            {
+                throw new FileNotFoundException("OVPN file was not created as expected.", fileInfo.FullName);
+            }
+
+            var issuedOvpnFile = new OvpnFileMetadata
+            {
+                CommonName = commonName,
+                FileName = fileInfo.Name,
+                FilePath = fileInfo.FullName,
+                IssuedAt = DateTime.UtcNow,
+                IssuedTo = issuedTo,
+                CertFilePath = certResult.CertificatePath,
+                KeyFilePath = certResult.KeyPath,
+            };
+
+            issuance.MarkCompleted();
+            return issuedOvpnFile;
         }
-
-        var ovpnFilePath = Path.Combine(targetDir, $"{commonName}.ovpn");
-        await File.WriteAllTextAsync(ovpnFilePath, ovpnContent, cancellationToken);
-
-        logger.LogInformation("Client configuration file created: {Path}", ovpnFilePath);
-
-        var fileInfo = new FileInfo(Path.GetFullPath(ovpnFilePath));
-        if (!fileInfo.Exists)
+        catch (Exception ex)
         {
-            throw new FileNotFoundException("OVPN file was not created as expected.", fileInfo.FullName);
+            issuance.MarkFailed(ex);
+            throw;
         }
-
-        var issuedOvpnFile = new OvpnFileMetadata
-        {
-            CommonName = commonName,
-            FileName = fileInfo.Name,
-            FilePath = fileInfo.FullName,
-            IssuedAt = DateTime.UtcNow,
-            IssuedTo = issuedTo,
-            CertFilePath = certResult.CertificatePath,
-            KeyFilePath = certResult.KeyPath,
-        };
-
-        return issuedOvpnFile;
     }
 
     public async Task<OvpnFileMetadata?> RevokeOvpnFile(string easyRsaPath, string commonName, 
@@ -101,11 +113,20 @@ public class OvpnFileService(
         };
     }
 
-    public async Task<OvpnFileDownload> GetOvpnFile(string fileName, string filePath, CancellationToken cancellationToken)
+    public async Task<OvpnFileDownload> GetOvpnFile(
+        string fileName,
+        string filePath,
+        string? commonName,
+        CancellationToken cancellationToken)
     {
+        filePath = Path.GetFullPath(filePath);
+
         if (!File.Exists(filePath))
         {
-            throw new Exception($"File {filePath} does not exist");
+            if (string.IsNullOrWhiteSpace(commonName))
+                throw new FileNotFoundException($"File {filePath} does not exist", filePath);
+
+            await issuanceTracker.WaitUntilReadyAsync(commonName, filePath, cancellationToken);
         }
 
         try
@@ -113,11 +134,12 @@ public class OvpnFileService(
             var content = await File.ReadAllBytesAsync(filePath, cancellationToken);
             return new OvpnFileDownload
             {
+                CommonName = commonName ?? string.Empty,
                 FileName = fileName,
                 Content = content
             };
         }
-        catch (Exception ex)
+        catch (Exception ex) when (ex is not FileNotFoundException and not TimeoutException and not OperationCanceledException)
         {
             throw new Exception($"Error reading OVPN file {filePath}: {ex.Message}", ex);
         }
@@ -160,7 +182,7 @@ public class OvpnFileService(
             .Append("-----END CERTIFICATE-----"));
     }
     
-    private static string GenerateOvpnFile(
+    private string GenerateOvpnFile(
         string configTemplate,
         string friendlyΝame,
         string serverIp,
@@ -183,7 +205,7 @@ public class OvpnFileService(
         if (string.IsNullOrWhiteSpace(tlsAuthKey))
             throw new ArgumentNullException(nameof(tlsAuthKey));
 
-        return configTemplate
+        var content = configTemplate
             .Replace("{{friendly_name}}", friendlyΝame)
             .Replace("{{server_ip}}", serverIp)
             .Replace("{{server_port}}", serverPort.ToString())
@@ -191,5 +213,8 @@ public class OvpnFileService(
             .Replace("{{client_cert}}", clientCert)
             .Replace("{{client_key}}", clientKey)
             .Replace("{{tls_auth_key}}", tlsAuthKey);
+
+        // Align client directives with live node env (same defaults as entrypoint.sh).
+        return OvpnClientTemplateSync.Apply(content, OvpnNodeClientSettings.FromConfiguration(configuration));
     }
 }

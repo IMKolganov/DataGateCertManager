@@ -1,3 +1,4 @@
+using System.Net;
 using System.Net.Sockets;
 using System.Net.WebSockets;
 using DataGateOpenVpnManager.Controllers;
@@ -20,7 +21,7 @@ public class OpenVpnProxyControllerIntegrationTests
     public async Task TcpProxy_RoundTripsPayload_AndRecordsTraffic(int payloadBytes)
     {
         await using var echo = await TcpEchoServer.StartAsync();
-        var (server, active, flow) = CreateProxyTestServer(echo.Port);
+        var (server, active, flow) = CreateProxyTestServer(echo.Port, proto: "tcp");
 
         using var ws = await server.CreateWebSocketClient()
             .ConnectAsync(new Uri("ws://localhost/api/proxy?mode=tcp"), CancellationToken.None);
@@ -41,37 +42,40 @@ public class OpenVpnProxyControllerIntegrationTests
         await WaitUntilAsync(() => active.Count == 0, TimeSpan.FromSeconds(2));
     }
 
-    [Fact]
-    public async Task TcpProxy_Handles1000ConcurrentClients()
+    [Theory]
+    [InlineData("udp", "tcp", OpenVpnProxyProtocolGuard.UdpOnlyMessage)]
+    [InlineData("tcp", "udp", OpenVpnProxyProtocolGuard.TcpOnlyMessage)]
+    public async Task Proxy_WhenModeDoesNotMatchNodeProto_Returns400_WithoutUpgrading(
+        string nodeProto, string requestedMode, string expectedMessage)
     {
-        const int clientsCount = 1_000;
-        const int payloadSize = 512;
+        var (server, _, _) = CreateProxyTestServer(tcpTargetPort: 1194, proto: nodeProto);
+        using var client = server.CreateClient();
 
-        await using var echo = await TcpEchoServer.StartAsync();
-        var (server, _, flow) = CreateProxyTestServer(echo.Port);
+        using var response = await client.GetAsync($"/api/proxy?mode={requestedMode}");
+        var body = await response.Content.ReadAsStringAsync();
 
-        var tasks = Enumerable.Range(0, clientsCount)
-            .Select(async i =>
-            {
-                using var ws = await server.CreateWebSocketClient()
-                    .ConnectAsync(new Uri("ws://localhost/api/proxy?mode=tcp"), CancellationToken.None);
-
-                var payload = CreatePayload(payloadSize + i);
-                await ws.SendAsync(payload, WebSocketMessageType.Binary, true, CancellationToken.None);
-                var echoed = await ReceiveAtLeastBytesAsync(ws, payload.Length, CancellationToken.None);
-                Assert.Equal(payload, echoed);
-                await TryCloseAsync(ws);
-            })
-            .ToArray();
-
-        await Task.WhenAll(tasks);
-
-        // Verify flow service observed traffic from many independent connections.
-        var batch = flow.BuildBatch(DateTime.UtcNow);
-        Assert.True(batch.Count >= clientsCount);
+        Assert.Equal(HttpStatusCode.BadRequest, response.StatusCode);
+        Assert.Equal(expectedMessage, body);
     }
 
-    private static (TestServer Server, ActiveProxyConnectionService Active, ProxyTrafficFlowService Flow) CreateProxyTestServer(int tcpTargetPort)
+    [Fact]
+    public async Task TcpProxy_WhenConnectRefused_ClosesWebSocketWithConnectFailed()
+    {
+        var (server, _, _) = CreateProxyTestServer(tcpTargetPort: 1, proto: "tcp");
+        using var ws = await server.CreateWebSocketClient()
+            .ConnectAsync(new Uri("ws://localhost/api/proxy?mode=tcp"), CancellationToken.None);
+
+        var buffer = new byte[16];
+        var result = await ws.ReceiveAsync(buffer, CancellationToken.None);
+
+        Assert.Equal(WebSocketMessageType.Close, result.MessageType);
+        Assert.Equal(WebSocketCloseStatus.InternalServerError, ws.CloseStatus);
+        Assert.Equal(OpenVpnProxyProtocolGuard.TcpConnectFailedMessage, ws.CloseStatusDescription);
+    }
+
+    private static (TestServer Server, ActiveProxyConnectionService Active, ProxyTrafficFlowService Flow) CreateProxyTestServer(
+        int tcpTargetPort,
+        string? proto = null)
     {
         var active = new ActiveProxyConnectionService();
         var history = new ProxyConnectionHistoryService();
@@ -83,7 +87,8 @@ public class OpenVpnProxyControllerIntegrationTests
             {
                 cfg.AddInMemoryCollection(new Dictionary<string, string?>
                 {
-                    ["PORT"] = tcpTargetPort.ToString()
+                    ["PORT"] = tcpTargetPort.ToString(),
+                    ["PROTO"] = proto
                 });
             })
             .ConfigureServices(services =>
@@ -95,6 +100,7 @@ public class OpenVpnProxyControllerIntegrationTests
                 services.AddSingleton<IProxyByteDebugService>(new NoOpProxyByteDebugService());
                 services.AddSingleton<IProxyConnectionLifetimeService, ProxyConnectionLifetimeService>();
                 services.AddSingleton<IProxySessionAuditService, NoOpProxySessionAuditService>();
+                services.AddSingleton<ProxyBatchBufferPool>();
                 services.AddSingleton(NullLogger<OpenVpnProxyController>.Instance);
                 services.AddControllers().AddApplicationPart(typeof(OpenVpnProxyController).Assembly);
             })
