@@ -1,10 +1,12 @@
 using DataGateOpenVpnManager.Models;
+using DataGateOpenVpnManager.Services.PiHole;
 using Microsoft.Extensions.Options;
 
 namespace DataGateOpenVpnManager.Services.Proxy;
 
 public sealed class OpenVpnManagementStatusRefreshService(
     IOptions<OpenVpnProxyOptions> options,
+    IPiHoleRuntimeOptionsStore piHoleRuntime,
     IOpenVpnManagementStatusCache statusCache,
     ILogger<OpenVpnManagementStatusRefreshService> logger) : BackgroundService
 {
@@ -12,7 +14,9 @@ public sealed class OpenVpnManagementStatusRefreshService(
     {
         while (!stoppingToken.IsCancellationRequested)
         {
-            if (!options.Value.NeedsBackgroundManagementRefresh)
+            var piHoleEnabled = piHoleRuntime.GetEffective().Enabled
+                                && !string.IsNullOrWhiteSpace(piHoleRuntime.GetEffective().BaseUrl);
+            if (!options.Value.NeedsBackgroundManagementRefresh(piHoleEnabled))
             {
                 await Task.Delay(TimeSpan.FromSeconds(5), stoppingToken);
                 continue;

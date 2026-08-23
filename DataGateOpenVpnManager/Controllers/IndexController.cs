@@ -2,6 +2,7 @@ using System.Reflection;
 using Microsoft.AspNetCore.Mvc;
 using DataGateMonitor.SharedModels.DataGateOpenVpnManager.Info;
 using DataGateMonitor.SharedModels.Responses;
+using DataGateOpenVpnManager.Helpers;
 using DataGateOpenVpnManager.Services.Interfaces;
 
 namespace DataGateOpenVpnManager.Controllers;
@@ -31,6 +32,8 @@ public class IndexController(
                 logger.LogWarning(ex, "Failed to resolve PublicIp for /api/info");
             }
 
+            var clientSettings = OvpnNodeClientSettings.FromConfiguration(config);
+
             var response = new RootOpenVpnInfoResponse
             {
                 Version = version,
@@ -48,7 +51,14 @@ public class IndexController(
                     DataDir = config["DATA_DIR"],
                     Port = config["PORT"],
                     ApiPort = config["API_PORT"],
-                    Proto = config["PROTO"],
+                    Proto = clientSettings.Proto ?? config["PROTO"],
+                    Cipher = clientSettings.Cipher,
+                    DataCiphers = clientSettings.DataCiphers,
+                    Dco = config["DCO"],
+                    Auth = clientSettings.Auth,
+                    TlsVersionMin = clientSettings.TlsVersionMin,
+                    MssFix = config["MSSFIX"],
+                    ClientVerb = clientSettings.ClientVerb,
                     OpenVpnManagement = new OpenVpnManagementInfoResponse
                     {
                         Host = config["OpenVpnManagement:Host"],

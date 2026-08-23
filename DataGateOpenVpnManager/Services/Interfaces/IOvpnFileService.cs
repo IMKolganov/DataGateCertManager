@@ -11,5 +11,9 @@ public interface IOvpnFileService
 
     Task<OvpnFileMetadata?> RevokeOvpnFile(string easyRsaPath, string commonName,
         string ovpnFileName, string ovpnFilePath, CancellationToken cancellationToken);
-    Task<OvpnFileDownload> GetOvpnFile(string fileName, string filePath, CancellationToken cancellationToken);
+    Task<OvpnFileDownload> GetOvpnFile(
+        string fileName,
+        string filePath,
+        string? commonName,
+        CancellationToken cancellationToken);
 }

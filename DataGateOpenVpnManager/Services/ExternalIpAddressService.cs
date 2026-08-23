@@ -115,10 +115,12 @@ public sealed class ExternalIpAddressService(
         if (!IPAddress.TryParse(candidate, out var address))
             return false;
 
-        if (address.AddressFamily is not (AddressFamily.InterNetwork or AddressFamily.InterNetworkV6))
+        // Dashboard / OpenVPN remote expect the public IPv4 clients connect to.
+        // Dual-stack providers (e.g. api64.ipify.org) often return IPv6 first — skip those.
+        if (address.AddressFamily != AddressFamily.InterNetwork)
             return false;
 
-        if (IPAddress.IsLoopback(address) || address.Equals(IPAddress.Any) || address.Equals(IPAddress.IPv6Any))
+        if (IPAddress.IsLoopback(address) || address.Equals(IPAddress.Any))
             return false;
 
         ip = address.ToString();

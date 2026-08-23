@@ -1,0 +1,6 @@
+**/bin/
+**/obj/
+**/.vs/
+wss-udp-proxy-rs/target/
+**/*.user
+**/.git

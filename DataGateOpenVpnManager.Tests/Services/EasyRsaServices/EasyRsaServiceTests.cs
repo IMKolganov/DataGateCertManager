@@ -23,7 +23,8 @@ public class EasyRsaServiceTests
             Mock.Of<IEasyRsaParseDbService>(),
             Mock.Of<IBashCommandRunner>(),
             Mock.Of<IOpenVpnServerService>(),
-            DefaultOptions);
+            DefaultOptions,
+            new EasyRsaPkiMutex());
 
         try
         {

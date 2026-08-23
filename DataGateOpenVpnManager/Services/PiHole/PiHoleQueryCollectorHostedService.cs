@@ -14,6 +14,7 @@ public sealed class PiHoleQueryCollectorHostedService(
     IPiHoleQueryCursorStore cursorStore,
     IPiHoleCollectorStatusStore statusStore,
     IOpenVpnManagementStatusCache managementStatusCache,
+    IOptions<OpenVpnProxyOptions> proxyOptions,
     IHubContext<OpenVpnEventHub> eventHub,
     ILogger<PiHoleQueryCollectorHostedService> logger) : BackgroundService
 {
@@ -148,13 +149,7 @@ public sealed class PiHoleQueryCollectorHostedService(
             return 0;
         }
 
-        var snapshot = managementStatusCache.GetSnapshot();
-        if (snapshot is null || !snapshot.IsValid)
-        {
-            logger.LogDebug("Pi-hole poll: refreshing OpenVPN management snapshot for CN mapping.");
-            await managementStatusCache.RefreshAsync(cancellationToken);
-            snapshot = managementStatusCache.GetSnapshot();
-        }
+        var snapshot = await EnsureManagementSnapshotForMappingAsync(cancellationToken);
 
         var enriched = identityResolver.Enrich(records, snapshot);
         var mapped = enriched.Where(q => !string.IsNullOrWhiteSpace(q.CommonName)).ToList();
@@ -171,9 +166,11 @@ public sealed class PiHoleQueryCollectorHostedService(
                 CursorUntilUtc = untilUtc
             });
             logger.LogInformation(
-                "Pi-hole poll: {AfterFilter} queries matched subnet but none mapped to VPN clients (management valid={ManagementValid}).",
+                "Pi-hole poll: {AfterFilter} queries matched subnet but none mapped to VPN clients (management valid={ManagementValid}, clients={ClientCount}, cacheAgeSec={CacheAgeSec:F0}).",
                 records.Count,
-                snapshot?.IsValid == true);
+                snapshot?.IsValid == true,
+                snapshot?.Clients.Count ?? 0,
+                snapshot is null ? -1 : (DateTime.UtcNow - snapshot.FetchedAtUtc).TotalSeconds);
             return 0;
         }
 
@@ -204,5 +201,23 @@ public sealed class PiHoleQueryCollectorHostedService(
             fromUtc,
             untilUtc);
         return mapped.Count;
+    }
+
+    private async Task<OpenVpnManagementStatusSnapshot?> EnsureManagementSnapshotForMappingAsync(
+        CancellationToken cancellationToken)
+    {
+        var snapshot = managementStatusCache.GetSnapshot();
+        if (!ProxyManagementPeerDiagnostics.NeedsRefreshForClientMapping(
+                snapshot,
+                proxyOptions.Value.ManagementCacheMaxAge))
+            return snapshot;
+
+        logger.LogDebug(
+            "Pi-hole poll: refreshing OpenVPN management snapshot for CN mapping (clients={ClientCount}, cacheAgeSec={CacheAgeSec:F0}).",
+            snapshot?.Clients.Count ?? 0,
+            snapshot is null ? -1 : (DateTime.UtcNow - snapshot.FetchedAtUtc).TotalSeconds);
+
+        await managementStatusCache.RefreshAsync(cancellationToken);
+        return managementStatusCache.GetSnapshot();
     }
 }

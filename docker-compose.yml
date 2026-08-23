@@ -15,6 +15,16 @@ services:
     ports:
       - "1295:1295/udp"
       - "5009:5009"
+    # For bridge networking only: raise UDP socket buffer caps so SO_RCVBUF=4MB in the
+    # WSS proxy is not silently clamped (~208KB default). With network_mode: host these
+    # sysctls are rejected by Docker — set the same keys on the host instead (sysctl -w).
+    # sysctls:
+    #   net.core.rmem_max: 16777216
+    #   net.core.wmem_max: 16777216
+    #   net.core.rmem_default: 1048576
+    #   net.core.wmem_default: 1048576
+    #   net.ipv4.udp_rmem_min: 262144
+    #   net.ipv4.udp_wmem_min: 262144
     environment:
       ASPNETCORE_ENVIRONMENT: ${ASPNETCORE_ENVIRONMENT:-Production}
       EASY_RSA_PATH: "/openvpn-udp/easy-rsa"
@@ -28,6 +38,10 @@ services:
       WAN_IF: eth0
       VPN_SUBNET: "10.50.28.0"
       VPN_NETMASK: "255.255.255.0"
+      # Stable device name — set a unique value per stack on multi-VPN hosts
+      TUN_DEV: ovpn-udp
+      # UDP WSS datapath: dotnet (default) | rust
+      # OPENVPN_WSS_UDP_PROXY: rust
 
 
 networks:
