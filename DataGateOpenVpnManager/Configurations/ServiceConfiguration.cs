@@ -73,6 +73,16 @@ public static class ServiceConfiguration
 
         services.AddHostedService<MicroserviceJwtValidatorInitializer>();
 
+        services.AddHttpClient(VpnServerAnnounceHostedService.HttpClientName, client =>
+        {
+            var baseUrl = config["Backend:BaseUrl"];
+            client.BaseAddress = new Uri(
+                VpnServerAnnounceApiUrlResolver.EnsureTrailingSlash(
+                    baseUrl ?? throw new InvalidOperationException("Backend:BaseUrl is required")));
+            client.Timeout = TimeSpan.FromSeconds(30);
+        });
+        services.AddHostedService<VpnServerAnnounceHostedService>();
+
         services.ConfigureProxy(config);
         services.ConfigurePiHole(config);
 
