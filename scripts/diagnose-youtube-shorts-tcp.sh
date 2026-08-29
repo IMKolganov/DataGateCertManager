@@ -116,15 +116,25 @@ pick_busiest_virt() {
 }
 
 have_quic_rules() {
-  sudo iptables -L FORWARD -n 2>/dev/null | grep -qE 'tun-tcp.*udp dpt:443.*(REJECT|DROP)' \
-    || sudo iptables -t raw -L PREROUTING -n 2>/dev/null | grep -qE 'tun-tcp.*udp dpt:443.*DROP'
+  local dev="${TCP_TUN_DEV:-tun-tcp}"
+  # Escape for basic grep; iface names are [A-Za-z0-9_.-]
+  sudo iptables -L FORWARD -n 2>/dev/null | grep -qE "${dev}.*udp dpt:443.*(REJECT|DROP)" \
+    || sudo iptables -t raw -L PREROUTING -n 2>/dev/null | grep -qE "${dev}.*udp dpt:443.*DROP"
+}
+
+assert_tun_dev_safe() {
+  local dev="${1:-}"
+  [[ "$dev" =~ ^[A-Za-z0-9][A-Za-z0-9._-]{0,15}$ ]] || {
+    bad "refusing unsafe TCP_TUN_DEV='$dev' (expected e.g. tun-tcp)"
+    return 1
+  }
 }
 
 cmd_check() {
   load_env
   local subnet_prefix="${TCP_VPN_SUBNET%.*}"
 
-  section "1 CONTAINERS"
+  section "1 CONTAINERS / PIHOLE NETNS"
   for name in openvpn-tcp-wss openvpn-udp-wss nginx datagate-pihole datagate-monitor-xray; do
     local st
     st="$(docker inspect -f '{{.State.Status}}{{if .State.Health}}/{{.State.Health.Status}}{{end}}' "$name" 2>/dev/null || echo missing)"
@@ -133,9 +143,25 @@ cmd_check() {
     elif [[ "$st" == missing ]]; then
       warn "$name not present"
     else
-      bad "$name ($st) — clients may still have traffic via cache/other DNS; still fix if Exited"
+      bad "$name ($st) — if Exited(128) No such container: sudo systemctl restart datagate-pihole-after-tcp.service"
     fi
   done
+  local tcp_id mode short
+  tcp_id="$(docker inspect -f '{{.Id}}' openvpn-tcp-wss 2>/dev/null || true)"
+  mode="$(docker inspect -f '{{.HostConfig.NetworkMode}}' datagate-pihole 2>/dev/null || echo missing)"
+  if [[ -n "$tcp_id" && "$mode" != missing ]]; then
+    short="${tcp_id:0:12}"
+    if [[ "$mode" == "container:${tcp_id}" || "$mode" == "container:${short}" ]]; then
+      ok "pihole NetworkMode=$mode (current TCP)"
+    else
+      bad "pihole NetworkMode=$mode — stale TCP id; sudo systemctl restart datagate-pihole-after-tcp.service"
+    fi
+  fi
+  if systemctl is-active datagate-pihole-after-tcp.service >/dev/null 2>&1; then
+    ok "datagate-pihole-after-tcp.service active"
+  else
+    warn "datagate-pihole-after-tcp.service not active — reboot/TCP recreate will strand Pi-hole"
+  fi
 
   section "2 TCP TUN / DCO / MSS"
   if ip link show "$TCP_TUN_DEV" &>/dev/null; then
@@ -164,10 +190,10 @@ cmd_check() {
   echo "--- raw PREROUTING (head) ---"
   sudo iptables -t raw -L PREROUTING -n -v --line-numbers 2>/dev/null | head -8 || true
   if have_quic_rules; then
-    warn "UDP/443 DROP|REJECT on tun-tcp still present — YouTube forced off QUIC; Shorts may look 'fixed'"
+    warn "UDP/443 DROP|REJECT on $TCP_TUN_DEV still present — YouTube forced off QUIC; Shorts may look 'fixed'"
     warn "run: $0 quic-unblock   then reconnect phone and retest"
   else
-    ok "no tun-tcp UDP/443 anti-QUIC test rules"
+    ok "no $TCP_TUN_DEV UDP/443 anti-QUIC test rules"
   fi
 
   section "4 PROXY SESSIONS (manager API :${TCP_API_PORT})"
@@ -251,6 +277,7 @@ summarize_pcap() {
 
 cmd_capture() {
   load_env
+  assert_tun_dev_safe "$TCP_TUN_DEV" || return 1
   CLIENT="${ARG2:-}"
   PCAP="${PCAP:-/tmp/shorts-stuck.pcap}"
   CAPTURE_SEC="${CAPTURE_SEC:-20}"
@@ -286,6 +313,7 @@ cmd_capture() {
 
 cmd_quic_block() {
   load_env
+  assert_tun_dev_safe "$TCP_TUN_DEV" || return 1
   section "QUIC BLOCK on $TCP_TUN_DEV (A/B test)"
   # raw PREROUTING survives DCO better than FORWARD alone (hel-1: FORWARD weak, raw counted).
   sudo iptables -t raw -C PREROUTING -i "$TCP_TUN_DEV" -p udp --dport 443 -j DROP 2>/dev/null \
@@ -300,6 +328,7 @@ cmd_quic_block() {
 
 cmd_quic_unblock() {
   load_env
+  assert_tun_dev_safe "$TCP_TUN_DEV" || return 1
   section "QUIC UNBLOCK — remove test rules"
   local i
   for i in 1 2 3 4 5; do
@@ -313,7 +342,7 @@ cmd_quic_unblock() {
     sudo iptables -L FORWARD -n -v --line-numbers | head -8
     sudo iptables -t raw -L PREROUTING -n -v --line-numbers | head -8
   else
-    ok "no tun-tcp UDP/443 anti-QUIC test rules left"
+    ok "no $TCP_TUN_DEV UDP/443 anti-QUIC test rules left"
   fi
   warn "Reconnect VPN on the phone before trusting Shorts results."
 }
